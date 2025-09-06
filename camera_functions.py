@@ -57,12 +57,18 @@ class CameraFunctions:
 
     def init_param(self):
         """初始化参数"""
-        # 基本参数
-        self.device_num = "0"
-        self.real = "0"
+        # 基本参数 - 只在未设置时才初始化
+        if not hasattr(self, 'device_num'):
+            self.device_num = "0"
+        if not hasattr(self, 'real'):
+            self.real = "0"
+        if not hasattr(self, 'bit_max'):
+            self.bit_max = 4095
+        if not hasattr(self, 'wave'):
+            self.wave = "mwir"
+            
         self.whonpz = "multi_point_correction.npz"
         self.bp_npz_path = "blind_pixels.npz"
-        self.bit_max = 4095
         self.frame_count = 0
         self.running = True
 
@@ -124,16 +130,30 @@ class CameraFunctions:
         try:
             if os.path.exists("background_frame.png"):
                 self.background_frame = cv2.imread("background_frame.png", -1)
+                print(f"背景帧已加载: {self.background_frame.mean()}")
         except Exception:
             pass
 
     def choose_camera_mode(self, real="0"):
         """选择相机模式"""
+        # 保存当前参数（如果已设置）
+        saved_device_num = getattr(self, 'device_num', None)
+        saved_wave = getattr(self, 'wave', None)
+        saved_bit_max = getattr(self, 'bit_max', None)
+        
         # 先停止当前数据源
         self.cleanup()
 
         # 重新初始化参数
         self.init_param()
+        
+        # 恢复保存的参数（如果存在）
+        if saved_device_num is not None:
+            self.device_num = saved_device_num
+        if saved_wave is not None:
+            self.wave = saved_wave
+        if saved_bit_max is not None:
+            self.bit_max = saved_bit_max
 
         # 清除离线图片模式
         self.offline_image_mode = False
@@ -401,17 +421,45 @@ class CameraFunctions:
         scaled = np.clip(scaled, 0, 255)
         return scaled.astype(np.uint8)
 
+    def apply_flip(self, frame, flip_mode="none"):
+        """应用翻转变换"""
+        if flip_mode == "none":
+            return frame
+        elif flip_mode == "horizontal":
+            return cv2.flip(frame, 1)  # 水平翻转
+        elif flip_mode == "vertical":
+            return cv2.flip(frame, 0)  # 垂直翻转
+        elif flip_mode == "both":
+            return cv2.flip(frame, -1)  # 水平垂直翻转
+        else:
+            return frame
+
+    def normalize_to_8bit_for_jpg(self, frame_16bit, max_val=None):
+        """将16位图像归一化到0-1再乘以255，用于JPG保存，不截断数据"""
+        if max_val is None:
+            max_val = self.bit_max
+        t = frame_16bit.astype(np.float64)  # 使用更高精度
+        # 归一化到0-1
+        normalized = t / max_val
+        # 乘以255并转换为8位
+        jpg_frame = (normalized * 255.0).astype(np.uint8)
+        return jpg_frame
+
     # 存储功能
     def save_background(self):
         """保存背景图"""
         try:
             if hasattr(self, "current_frame"):
                 self.background_frame = self.current_frame.copy()
+                # 保存16位PNG
                 cv2.imwrite(
                     "background_frame.png",
                     self.background_frame.copy().astype(np.uint16),
                 )
-                print("Info", "Background frame saved successfully!")
+                # 保存8位JPG
+                jpg_frame = self.normalize_to_8bit_for_jpg(self.background_frame)
+                cv2.imwrite("background_frame.jpg", jpg_frame)
+                print("Info", "Background frame saved successfully! (PNG + JPG)")
             else:
                 print("Error", "No frame available to save!")
         except Exception as e:
@@ -423,11 +471,15 @@ class CameraFunctions:
         try:
             if hasattr(self, "current_frame"):
                 self.whiteground_frame = self.current_frame.copy()
+                # 保存16位PNG
                 cv2.imwrite(
                     "whiteground_frame.png",
                     self.whiteground_frame.astype(np.uint16),
                 )
-                print("Info", "Whiteground frame saved successfully!")
+                # 保存8位JPG
+                jpg_frame = self.normalize_to_8bit_for_jpg(self.whiteground_frame)
+                cv2.imwrite("whiteground_frame.jpg", jpg_frame)
+                print("Info", "Whiteground frame saved successfully! (PNG + JPG)")
             else:
                 print("Error", "No frame available to save!")
         except Exception as e:
@@ -454,11 +506,20 @@ class CameraFunctions:
                     display_frame = self.current_frame.copy().astype(np.uint16)
                     # 使用时间戳命名（加上计数后缀避免同一秒重复）
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    filename = f"display_{timestamp}_{count:03d}.png"
-                    filepath = os.path.join(folder, filename)
-                    cv2.imwrite(filepath, display_frame)
+                    
+                    # 保存16位PNG
+                    png_filename = f"display_{timestamp}_{count:03d}.png"
+                    png_filepath = os.path.join(folder, png_filename)
+                    cv2.imwrite(png_filepath, display_frame)
+                    
+                    # 保存8位JPG
+                    jpg_filename = f"display_{timestamp}_{count:03d}.jpg"
+                    jpg_filepath = os.path.join(folder, jpg_filename)
+                    jpg_frame = self.normalize_to_8bit_for_jpg(self.current_frame)
+                    cv2.imwrite(jpg_filepath, jpg_frame)
+                    
                     count += 1
-                    print(f"已保存第 {count}/{save_count} 张图片")
+                    print(f"已保存第 {count}/{save_count} 张图片 (PNG + JPG)")
                 time.sleep(0.03)  # 默认保存间隔0.03秒
         except Exception as e:
             print(f"自动保存出错:{e},详细内容如下：")
@@ -489,9 +550,18 @@ class CameraFunctions:
                     # 使用时间戳命名，添加毫秒部分以保证唯一性
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     ms = int(time.time() * 1000) % 1000
-                    filename = f"display_{timestamp}_{ms:03d}.png"
-                    filepath = os.path.join(folder, filename)
-                    cv2.imwrite(filepath, display_frame)
+                    
+                    # 保存16位PNG
+                    png_filename = f"display_{timestamp}_{ms:03d}.png"
+                    png_filepath = os.path.join(folder, png_filename)
+                    cv2.imwrite(png_filepath, display_frame)
+                    
+                    # 保存8位JPG
+                    jpg_filename = f"display_{timestamp}_{ms:03d}.jpg"
+                    jpg_filepath = os.path.join(folder, jpg_filename)
+                    jpg_frame = self.normalize_to_8bit_for_jpg(self.current_frame)
+                    cv2.imwrite(jpg_filepath, jpg_frame)
+                    
                 # 控制保存频率，与界面刷新同步
                 time.sleep(0.03)
         except Exception as e:
@@ -544,13 +614,33 @@ class CameraFunctions:
         """单点校正(b-)"""
         self.non_uniform_0_enabled = not self.non_uniform_0_enabled
         state = "enabled" if self.non_uniform_0_enabled else "disabled"
+        
+        # 如果启用单点校正但没有背景帧，使用当前帧作为背景帧
+        if self.non_uniform_0_enabled and self.background_frame is None and self.current_frame is not None:
+            self.background_frame = self.current_frame.copy()
+            print("Info", "使用当前帧作为背景帧进行单点校正")
+        
         print("Info", f"Non-uniform correction {state}")
+        
+        # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
 
     def non_uniform_correction_1(self):
         """单点校正(-b)"""
         self.non_uniform_1_enabled = not self.non_uniform_1_enabled
         state = "enabled" if self.non_uniform_1_enabled else "disabled"
+        
+        # 如果启用单点校正但没有背景帧，使用当前帧作为背景帧
+        if self.non_uniform_1_enabled and self.background_frame is None and self.current_frame is not None:
+            self.background_frame = self.current_frame.copy()
+            print("Info", "使用当前帧作为背景帧进行单点校正")
+        
         print("Info", f"Non-uniform correction {state}")
+        
+        # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
 
     def bp_correction(self):
         """坏点检测"""

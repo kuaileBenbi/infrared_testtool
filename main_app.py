@@ -48,6 +48,9 @@ class CameraApp:
         # 重写离线图片重新处理方法
         self.camera_func._trigger_offline_reprocess = self.process_offline_image
 
+        # 设置翻转回调函数
+        self.ui.flip_callback = self.on_flip_mode_changed
+
         # 启动帧率更新
         self.ui.capture_fps_label.after(1000, self._update_fps)
 
@@ -194,6 +197,9 @@ class CameraApp:
 
             # 显示处理后的图像
             display_frame = self.camera_func.scale_to_8bit(processed_frame)
+            # 应用翻转
+            flip_mode = self.ui.flip_mode.get()
+            display_frame = self.camera_func.apply_flip(display_frame, flip_mode)
             display_rgb = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2RGB)
 
             # 如果启用十字星，绘制十字星
@@ -257,7 +263,7 @@ class CameraApp:
 
             # 设置相机功能参数
             self.camera_func.device_num = device_num
-            self.camera_func.whonpz = band
+            self.camera_func.wave = band
             self.camera_func.bit_max = bit_max
 
             if source == "camera":
@@ -495,6 +501,9 @@ class CameraApp:
 
         # 可视化部分：在图像上绘制ROI标记
         display_frame = self.camera_func.scale_to_8bit(self.camera_func.current_frame)
+        # 应用翻转
+        flip_mode = self.ui.flip_mode.get()
+        display_frame = self.camera_func.apply_flip(display_frame, flip_mode)
         display_rgb = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2RGB).copy()
 
         # 绘制 ROI 边界和中心点
@@ -515,6 +524,9 @@ class CameraApp:
 
         # 显示原图（不绘制ROI标记）
         display_frame = self.camera_func.scale_to_8bit(self.camera_func.current_frame)
+        # 应用翻转
+        flip_mode = self.ui.flip_mode.get()
+        display_frame = self.camera_func.apply_flip(display_frame, flip_mode)
         display_rgb = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2RGB)
 
         # 如果启用十字星，绘制十字星
@@ -534,6 +546,17 @@ class CameraApp:
         self.ui.roi_pixel_value_text.delete(1.0, tk.END)
 
         print("ROI标记已清除")
+
+    def on_flip_mode_changed(self):
+        """翻转模式改变时的回调函数"""
+        if self.camera_func.current_frame is not None:
+            # 如果有当前帧，重新显示图像
+            if self.camera_func.offline_image_mode and self.camera_func.offline_image is not None:
+                # 离线图片模式，重新处理图片
+                self.process_offline_image()
+            else:
+                # 实时模式，重新显示当前帧
+                self.on_new_frame_event()
 
     def update_zoom_window(self):
         """更新放大窗口"""
@@ -622,8 +645,12 @@ class CameraApp:
 
         # 1) 手动拉伸到8位
         display_frame = self.camera_func.scale_to_8bit(frame_16bit)
+        
+        # 2) 应用翻转
+        flip_mode = self.ui.flip_mode.get()
+        display_frame = self.camera_func.apply_flip(display_frame, flip_mode)
 
-        # 2) 再把灰度转成 RGB 以便 PhotoImage 显示
+        # 3) 再把灰度转成 RGB 以便 PhotoImage 显示
         display_rgb = cv2.cvtColor(display_frame, cv2.COLOR_GRAY2RGB)
 
         # 如果启用，则绘制十字星
@@ -682,3 +709,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # import cv2
+    # import matplotlib.pyplot as plt
+
+    # img_path = "D:/Projects/2025/145corr/nuc/waichang/0822/0822waichang/mwir_flip/mwir_6km/mwir_7ms/raw_20240825_201044_0000.png"
+    # img = cv2.imread(img_path, -1)
+
+    # bk = cv2.imread("background_frame.png", -1)
+
+    # res = cv2.subtract(bk, img)
+
+    # print(f"img: {img.mean()}, bk: {bk.mean()}, res: {res.mean()}")
+
+    # plt.imshow(res, cmap='gray')
+    # plt.show()
