@@ -709,17 +709,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # import cv2
-    # import matplotlib.pyplot as plt
-
-    # img_path = "D:/Projects/2025/145corr/nuc/waichang/0822/0822waichang/mwir_flip/mwir_6km/mwir_7ms/raw_20240825_201044_0000.png"
-    # img = cv2.imread(img_path, -1)
-
-    # bk = cv2.imread("background_frame.png", -1)
-
-    # res = cv2.subtract(bk, img)
-
-    # print(f"img: {img.mean()}, bk: {bk.mean()}, res: {res.mean()}")
-
-    # plt.imshow(res, cmap='gray')
-    # plt.show()
