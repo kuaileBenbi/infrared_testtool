@@ -351,11 +351,6 @@ class UIConfig:
         )
         self.start_stop_btn.pack(fill=tk.X, pady=2)
 
-        # 状态标签
-        self.data_source_status = tk.Label(
-            data_source_frame, text="状态: 未开始", fg="red"
-        )
-        self.data_source_status.pack(fill=tk.X, pady=2)
 
     def on_data_source_change(self):
         """数据源改变时的处理"""
@@ -570,11 +565,6 @@ class UIConfig:
         )
         self.capture_fps_label.pack(fill=tk.X, pady=2)
 
-        # 图像信息
-        self.image_info_label = tk.Label(
-            status_frame, text="图像尺寸: 未加载", font=self.default_font
-        )
-        self.image_info_label.pack(fill=tk.X, pady=2)
 
     def create_right_panel(self):
         """创建右侧信息显示面板"""

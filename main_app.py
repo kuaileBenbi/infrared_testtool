@@ -144,6 +144,7 @@ class CameraApp:
         try:
             # 使用OpenCV加载图像
             image = cv2.imread(filepath, -1)
+            print(image.mean())
             if image is None:
                 print(f"无法加载图像: {filepath}")
                 return
