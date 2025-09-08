@@ -23,7 +23,6 @@ import numpy as np
 
 TOL_factor = 0.01
 pixel_type = np.uint16
-pixel_max = 16383
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +47,7 @@ class ImagePreprocessor:
 
     def linear_corr(self, raw_frame, nuc_dict, bit_max):
         a_map, b_map, ga, gb = nuc_dict["a_map"], nuc_dict["b_map"], nuc_dict["ga"], nuc_dict["gb"]
-        return self.apply_multi_calibration(raw_frame, a_map, b_map, ga, gb, bit_max)
+        return self.apply_linear_calibration(raw_frame, a_map, b_map, ga, gb, bit_max)
 
     def quadrast_corr(self, raw_frame, nuc_dict, bit_max):
         a2_arr, a1_arr, a0_arr = nuc_dict["a2"], nuc_dict["a1"], nuc_dict["a0"]
@@ -56,7 +55,7 @@ class ImagePreprocessor:
     
     def apply_quadratic_correction(
         self,
-        image,
+        raw_arr_float,
         a2_arr,
         a1_arr,
         a0_arr,
@@ -80,16 +79,28 @@ class ImagePreprocessor:
             1. 输入图像应为 uint16 类型
             2. 输出图像为 uint16 类型
         """
-        print(f"raw image mean: {image.mean()}")
-        image = image.astype(np.float32)
-        corrected = a2_arr * image**2 + a1_arr * image + a0_arr
+        print(f"raw image mean: {raw_arr_float.mean()}")
+        raw_arr_float = raw_arr_float.astype(np.float32)
 
-        corrected = np.clip(corrected, 0, bit_max)
-        print(f"corrected image mean: {corrected.mean()}")
-        # corrected = (corrected / bit_max * out_max).astype(np.uint8)
-        return np.rint(corrected).astype(np.uint16)
+        corrected_arr = np.empty_like(raw_arr_float, dtype=np.float32)
 
-    def apply_multi_calibration(
+        # 原地计算：y = a2 * x^2 + a1 * x + a0
+        np.multiply(
+            raw_arr_float, raw_arr_float, out=corrected_arr
+        )  # corrected_arr = raw_arr^2
+        np.multiply(
+            corrected_arr, a2_arr, out=corrected_arr
+        )  # corrected_arr = a2 * raw_arr^2
+        corrected_arr += a1_arr * raw_arr_float  # corrected_arr += a1 * raw_arr
+        corrected_arr += a0_arr  # corrected_arr += a0
+
+        corrected_arr = np.clip(corrected_arr, 0, bit_max)
+
+        print(f"corrected image mean: {corrected_arr.mean()}")
+
+        return np.rint(corrected_arr).astype(np.uint16)
+
+    def apply_linear_calibration(
         self,
         raw: np.ndarray,
         a_map: np.ndarray,
@@ -227,14 +238,6 @@ class ImagePreprocessor:
 
         return image.astype(np.uint16)
 
-    def pixel_nuc(self, test_img, coef_map):
-        B = coef_map["bk"]
-        G = coef_map["poly"]
-        ref = coef_map["ref"]
-        corrected = (test_img - B) * G
-        corrected = np.clip(corrected, 0, ref)
-        corrected = (corrected / ref) * 4095
-        return corrected.astype(np.uint16)
 
     def dw_nuc(self, raw, coef, bit_max):
         gain_map = coef["gain_map"]
@@ -246,28 +249,10 @@ class ImagePreprocessor:
         corrected = (corrected / ref) * bit_max
         return corrected.astype(np.uint16)
 
-    def apply_non_uniform_correction(self, test_img, coef_map):
-        """应用非均匀校正"""
-        b_map, a_map, global_a, global_b = (
-            coef_map["b_map"],
-            coef_map["a_map"],
-            coef_map["ga"],
-            coef_map["gb"],
-        )
-        raw = test_img.astype(np.float32)
-        corr = (raw - b_map) / a_map
-        if global_a is not None and global_b is not None:
-            corr = corr * global_a + global_b
-        
-        corr = np.clip(corr, 0, 4095)
 
-        return corr.astype(np.uint16)
-
-    def imadjust(self, x, a, b, c, d, gamma=1):
-        y = (((x - a) / (b - a)) ** gamma) * (d - c) + c
-        return y
-
-    def process(self, img, gamma=1.0):
+    def process(self, img, gamma=1.0, bit_max=None):
+        if bit_max is None:
+            return img
         t = img.astype(np.float32)
         t = cv2.medianBlur(t, ksize=3)
         # 角点修正
@@ -279,8 +264,8 @@ class ImagePreprocessor:
         lo = np.percentile(t, 100 * TOL_factor)
         hi = np.percentile(t, 100 * (1 - TOL_factor))
         # 矢量化拉伸
-        t = self.imadjust_vec(t, lo, hi, 0, 4095, gamma=gamma)
-        np.clip(t, 0, 4095, out=t)
+        t = self.imadjust_vec(t, lo, hi, 0, bit_max, gamma=gamma)
+        np.clip(t, 0, bit_max, out=t)
         return t.astype(np.uint16)
 
     @staticmethod

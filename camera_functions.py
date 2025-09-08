@@ -374,7 +374,7 @@ class CameraFunctions:
             )
 
         if self.adjust_enabled:
-            processed_frame = self.precessor.process(processed_frame)
+            processed_frame = self.precessor.process(processed_frame, gamma=1.0, bit_max=self.bit_max)
 
         if self.denoise_enabled:
             processed_frame = self.precessor.apply_denoise(processed_frame)
