@@ -421,12 +421,14 @@ class CameraApp:
             offset_y = (canvas_height - display_height) // 2
         elif self.ui.display_mode == "stretch":
             # 拉伸模式：图像填充整个画布
+            scale = 1.0  # 拉伸模式下不需要缩放，但为了代码一致性设置scale
             display_width = canvas_width
             display_height = canvas_height
             offset_x = 0
             offset_y = 0
         else:  # original
             # 原始模式：显示原始大小
+            scale = 1.0  # 原始模式下缩放比例为1
             display_width = img_w
             display_height = img_h
             offset_x = (canvas_width - display_width) // 2

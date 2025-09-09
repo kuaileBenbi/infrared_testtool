@@ -52,6 +52,10 @@ class ImagePreprocessor:
     def quadrast_corr(self, raw_frame, nuc_dict, bit_max):
         a2_arr, a1_arr, a0_arr = nuc_dict["a2"], nuc_dict["a1"], nuc_dict["a0"]
         return self.apply_quadratic_correction(raw_frame, a2_arr, a1_arr, a0_arr, bit_max)
+
+    def dw_nuc(self, raw_frame, nuc_dict, bit_max):
+        gain_map, offset_map, ref = nuc_dict["gain_map"], nuc_dict["offset_map"], nuc_dict["ref"]
+        return self.apply_dw_nuc(raw_frame, gain_map, offset_map, ref, bit_max)
     
     def apply_quadratic_correction(
         self,
@@ -141,6 +145,16 @@ class ImagePreprocessor:
 
         corr = np.clip(corr, 0, float(bit_max))
         return np.rint(corr).astype(np.uint16)
+
+
+    def apply_dw_nuc(self, raw, gain_map, offset_map, ref, bit_max):
+        # print(f"raw image mean: {raw.mean()}, ref: {ref}")
+        corrected = gain_map * raw + offset_map
+        corrected = np.clip(corrected, 0, ref)
+        # print(f"corrected image mean: {corrected.mean()}")
+        corrected = (corrected / ref) * bit_max
+        # print(f"corrected image mean: {corrected.mean()}")
+        return corrected.astype(np.uint16)
 
     def apply_autogian(self, frame):
         # 自动亮度调整：使用自动方法如直方图均衡化来自动优化图像的亮度和对比度。
@@ -237,17 +251,6 @@ class ImagePreprocessor:
         image[blind_mask] = blurred[blind_mask]
 
         return image.astype(np.uint16)
-
-
-    def dw_nuc(self, raw, coef, bit_max):
-        gain_map = coef["gain_map"]
-        offset_map = coef["offset_map"]
-        ref = coef["ref"]
-
-        corrected = gain_map * raw + offset_map
-        corrected = np.clip(corrected, 0, ref)
-        corrected = (corrected / ref) * bit_max
-        return corrected.astype(np.uint16)
 
 
     def process(self, img, gamma=1.0, bit_max=None):

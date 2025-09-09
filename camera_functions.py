@@ -75,8 +75,7 @@ class CameraFunctions:
         # 处理标志
         self.non_uniform_0_enabled = False
         self.non_uniform_1_enabled = False
-        self.non_uniform_3_enabled = False  # 多点校正
-        self.non_uniform_4_enabled = False
+        self.dw_nuc_enabled = False
         self.bp_correction_enabled = False
         self.bp_tab_correction_enabled = False
 
@@ -300,8 +299,7 @@ class CameraFunctions:
         if self.non_uniform_0_enabled and self.background_frame is not None:
 
             self.non_uniform_1_enabled = False
-            self.non_uniform_3_enabled = False
-            self.non_uniform_4_enabled = False
+            self.dw_nuc_enabled = False
             self.linear_nuc_enabled = False
             self.quadrast_nuc_enabled = False
 
@@ -309,29 +307,15 @@ class CameraFunctions:
 
         if self.non_uniform_1_enabled and self.background_frame is not None:
             self.non_uniform_0_enabled = False
-            self.non_uniform_3_enabled = False
-            self.non_uniform_4_enabled = False
+            self.dw_nuc_enabled = False
             self.linear_nuc_enabled = False
             self.quadrast_nuc_enabled = False
 
             processed_frame = cv2.subtract(processed_frame, self.background_frame)
 
-        if self.non_uniform_3_enabled and self.nuc_para is not None:
+        if self.dw_nuc_enabled and self.nuc_para is not None:
             self.non_uniform_0_enabled = False
             self.non_uniform_1_enabled = False
-            self.non_uniform_4_enabled = False
-            self.linear_nuc_enabled = False
-            self.quadrast_nuc_enabled = False
-
-            # 多点校正
-            processed_frame = self.precessor.apply_non_uniform_correction(
-                processed_frame, self.nuc_para
-            )
-
-        if self.non_uniform_4_enabled and self.nuc_para is not None:
-            self.non_uniform_0_enabled = False
-            self.non_uniform_1_enabled = False
-            self.non_uniform_3_enabled = False
             self.linear_nuc_enabled = False
             self.quadrast_nuc_enabled = False
 
@@ -342,8 +326,8 @@ class CameraFunctions:
         if self.linear_nuc_enabled and self.nuc_para is not None:
             self.non_uniform_0_enabled = False
             self.non_uniform_1_enabled = False
-            self.non_uniform_3_enabled = False
-            self.non_uniform_4_enabled = False
+
+            self.dw_nuc_enabled = False
             self.quadrast_nuc_enabled = False
 
             processed_frame = self.precessor.linear_corr(
@@ -353,8 +337,7 @@ class CameraFunctions:
         if self.quadrast_nuc_enabled and self.nuc_para is not None:
             self.non_uniform_0_enabled = False
             self.non_uniform_1_enabled = False
-            self.non_uniform_3_enabled = False
-            self.non_uniform_4_enabled = False
+            self.dw_nuc_enabled = False
             self.linear_nuc_enabled = False
 
             processed_frame = self.precessor.quadrast_corr(
@@ -674,13 +657,14 @@ class CameraFunctions:
         if not self.bp_tab_correction_enabled:
             # 启用时加载文件
             try:
-                if not os.path.exists(self.bp_npz_path):
-                    print("文件 'blind_pixels.npz' 不存在。")
-                    return
-
-                # 加载npz文件
-                data = np.load(self.bp_npz_path)
-                self.blind_tab_mask = data["blind"].astype(bool)
+                if self.blind_tab_mask is None:
+                    if not os.path.exists(self.bp_npz_path):
+                        print("文件 'blind_pixels.npz' 不存在。")
+                        return
+                    else:
+                        # 加载npz文件
+                        data = np.load(self.bp_npz_path)
+                        self.blind_tab_mask = data["blind"].astype(bool)
 
                 # 标记为启用坏点查表补偿
                 self.bp_tab_correction_enabled = True
@@ -696,8 +680,9 @@ class CameraFunctions:
         else:
             # 关闭功能
             self.bp_tab_correction_enabled = False
-            self.blind_tab_mask = None
             print("坏点查表补偿已禁用。")
+            if self.offline_image_mode and self.offline_image is not None:
+                self._trigger_offline_reprocess()
 
     def linear_multi_point_correction(self):
         """线性校正"""
@@ -759,7 +744,7 @@ class CameraFunctions:
 
     def dark_white_correction(self):
         """明暗校正"""
-        if not self.non_uniform_4_enabled:
+        if not self.dw_nuc_enabled:
             try:
                 if not os.path.exists(self.whonpz):
                     print(f"文件 '{self.whonpz}' 不存在。")
@@ -769,7 +754,7 @@ class CameraFunctions:
 
                 print(f"成功加载明暗校正文件: {self.whonpz}，明暗校正已启用。")
 
-                self.non_uniform_4_enabled = True
+                self.dw_nuc_enabled = True
 
                 # 如果是离线图片模式，重新处理图片
                 if self.offline_image_mode and self.offline_image is not None:
@@ -780,7 +765,7 @@ class CameraFunctions:
 
         else:
             # 关闭功能
-            self.non_uniform_4_enabled = False
+            self.dw_nuc_enabled = False
             self.nuc_para = None
             print("明暗校正已禁用。")
 
@@ -842,8 +827,7 @@ class CameraFunctions:
         """显示原图"""
         self.non_uniform_1_enabled = False
         self.non_uniform_0_enabled = False
-        self.non_uniform_3_enabled = False
-        self.non_uniform_4_enabled = False
+        self.dw_nuc_enabled = False
 
         self.bp_correction_enabled = False
         self.bp_tab_correction_enabled = False
