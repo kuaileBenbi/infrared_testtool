@@ -607,7 +607,7 @@ class ImagePreprocessor:
         print(f"draw_center_cross_polylines 处理耗时: {elapsed_time:.4f} 秒")
         return image
 
-    def apply_defog(self, image, t_min=0.1, omega=0.95, guided_filter_radius=40, guided_filter_eps=0.001):
+    def apply_defog(self, image, t_min=0.1, omega=0.95, guided_filter_radius=40, guided_filter_eps=1e-3, in_max=None):
         """
         透雾算法 - 基于暗通道先验的去雾算法
         :param image: 输入图像 (BGR格式或灰度图)
@@ -619,135 +619,112 @@ class ImagePreprocessor:
         """
         start_time = time.time()
         
-        # 检查输入图像类型并处理
-        if len(image.shape) == 2:
-            # 灰度图像，转换为3通道
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-            is_grayscale = True
+        orig_dtype = image.dtype
+        is_grayscale = (image.ndim == 2)
+
+        # ---- 统一为3通道参与计算，输出再还原 ----
+        if is_grayscale:
+            img3 = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         else:
-            is_grayscale = False
-        
-        # 确保输入是float32类型
-        if image.dtype != np.float32:
-            image = image.astype(np.float32) / 255.0
-        
-        # 计算暗通道
-        def get_dark_channel(image, patch_size=15):
-            """计算暗通道"""
-            min_channel = np.min(image, axis=2)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (patch_size, patch_size))
-            dark_channel = cv2.erode(min_channel, kernel)
-            return dark_channel
-        
-        # 估计大气光
-        def estimate_atmospheric_light(image, dark_channel, top_percent=0.1):
-            """估计大气光值"""
-            h, w = image.shape[:2]
-            num_pixels = int(h * w * top_percent)
-            
-            # 获取暗通道值最大的像素位置
-            flat_dark = dark_channel.flatten()
-            indices = np.argpartition(flat_dark, -num_pixels)[-num_pixels:]
-            
-            # 在这些位置中找到最亮的像素
-            flat_image = image.reshape(-1, 3)
-            candidate_pixels = flat_image[indices]
-            
-            # 计算每个像素的亮度（L2范数）
-            brightness = np.linalg.norm(candidate_pixels, axis=1)
-            brightest_idx = np.argmax(brightness)
-            
-            return candidate_pixels[brightest_idx]
-        
-        # 估计透射率
-        def estimate_transmission(image, atmospheric_light, omega=0.95):
-            """估计透射率"""
-            # 归一化图像
-            normalized = image / atmospheric_light
-            
-            # 计算暗通道
-            dark_channel = get_dark_channel(normalized)
-            
-            # 计算透射率
-            transmission = 1 - omega * dark_channel
-            return transmission
-        
-        # 引导滤波
-        def guided_filter(guide, src, radius, eps):
-            """引导滤波"""
+            img3 = image
+
+        img3 = img3.astype(np.float32)
+
+        # ---- 识别/设定输入满量程 ----
+        def _auto_in_max(arr_u16):
+            vmax = int(arr_u16.max())
+            # 常见有效位宽就近上限（保留“头部空间”，避免把没打满的图压得过亮）
+            if vmax <= 4095:   return 4095.0   # 12-bit
+            if vmax <= 16383:  return 16383.0  # 14-bit
+            return 65535.0                     # 16-bit（默认）
+        if in_max is None:
+            if orig_dtype == np.uint16:
+                in_scale = _auto_in_max(image)
+            elif orig_dtype == np.uint8:
+                in_scale = 255.0
+            else:
+                # float 输入：按当前最大值近似为满量程，至少防零
+                cur_max = float(np.max(img3)) if img3.size else 1.0
+                in_scale = max(cur_max, 1.0)
+        else:
+            in_scale = float(in_max)
+
+        # ---- 归一化到[0,1] ----
+        img = np.clip(img3 / max(in_scale, 1.0), 0.0, 1.0)
+
+        # ---- 内部函数 ----
+        def get_dark_channel(im, patch_size=15):
+            k = max(3, int(patch_size) | 1)  # 奇数核
+            min_channel = np.min(im, axis=2)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+            return cv2.erode(min_channel, kernel)
+
+        def estimate_atmospheric_light(im, dark, top_percent=0.001):
+            h, w = im.shape[:2]
+            n = max(1, int(h * w * top_percent))
+            flat_dark = dark.reshape(-1)
+            idx = np.argpartition(flat_dark, -n)[-n:]
+            cand = im.reshape(-1, 3)[idx]
+            A = cand[np.argmax(np.linalg.norm(cand, axis=1))]
+            return np.maximum(A, 1e-3)
+
+        def estimate_transmission(im, A, omega=0.95):
+            normalized = im / (A[None, None, :] + 1e-6)
+            dark_norm = get_dark_channel(normalized)
+            return 1.0 - omega * dark_norm
+
+        def guided_filter(guide_rgb, src, radius, eps):
+            # guide/src 已在[0,1]，不再 /255
+            guide = guide_rgb
             if guide.ndim == 3:
                 guide = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY)
-            
-            guide = guide.astype(np.float32) / 255.0
+            guide = guide.astype(np.float32)
             src = src.astype(np.float32)
-            
-            # 计算均值
-            mean_guide = cv2.boxFilter(guide, -1, (radius, radius))
-            mean_src = cv2.boxFilter(src, -1, (radius, radius))
-            mean_guide_src = cv2.boxFilter(guide * src, -1, (radius, radius))
-            
-            # 计算协方差
-            cov_guide_src = mean_guide_src - mean_guide * mean_src
-            var_guide = cv2.boxFilter(guide * guide, -1, (radius, radius)) - mean_guide * mean_guide
-            
-            # 计算系数
-            a = cov_guide_src / (var_guide + eps)
-            b = mean_src - a * mean_guide
-            
-            # 计算均值
-            mean_a = cv2.boxFilter(a, -1, (radius, radius))
-            mean_b = cv2.boxFilter(b, -1, (radius, radius))
-            
-            # 输出
+
+            k = int(radius)
+            k = (2*k + 1, 2*k + 1)  # 以“半径”定义窗口
+            mean_g  = cv2.boxFilter(guide, -1, k, normalize=True)
+            mean_s  = cv2.boxFilter(src,   -1, k, normalize=True)
+            mean_gs = cv2.boxFilter(guide * src, -1, k, normalize=True)
+
+            cov_gs = mean_gs - mean_g * mean_s
+            var_g  = cv2.boxFilter(guide * guide, -1, k, normalize=True) - mean_g * mean_g
+
+            a = cov_gs / (var_g + eps)
+            b = mean_s - a * mean_g
+
+            mean_a = cv2.boxFilter(a, -1, k, normalize=True)
+            mean_b = cv2.boxFilter(b, -1, k, normalize=True)
             return mean_a * guide + mean_b
-        
-        # 恢复图像
-        def recover_image(image, transmission, atmospheric_light, t_min=0.1):
-            """恢复去雾图像"""
-            # 限制透射率的最小值
-            transmission = np.maximum(transmission, t_min)
-            
-            # 恢复图像
-            recovered = np.zeros_like(image)
-            for i in range(3):
-                recovered[:, :, i] = (image[:, :, i] - atmospheric_light[i]) / transmission + atmospheric_light[i]
-            
-            return recovered
-        
+
+        def recover_image(im, t, A, t_floor=0.1):
+            t = np.clip(np.nan_to_num(t, nan=1.0, posinf=1.0, neginf=1.0), t_floor, 0.999)
+            J = (im - A[None, None, :]) / t[..., None] + A[None, None, :]
+            return J
+
         try:
-            # 1. 计算暗通道
-            dark_channel = get_dark_channel(image)
-            
-            # 2. 估计大气光
-            atmospheric_light = estimate_atmospheric_light(image, dark_channel)
-            
-            # 3. 估计透射率
-            transmission = estimate_transmission(image, atmospheric_light, omega)
-            
-            # 4. 使用引导滤波优化透射率
-            transmission = guided_filter(image, transmission, guided_filter_radius, guided_filter_eps)
-            
-            # 5. 恢复图像
-            result = recover_image(image, transmission, atmospheric_light, t_min)
-            
-            # 6. 限制像素值范围并转换回uint8
-            result = np.clip(result, 0, 1)
-            result = (result * 255).astype(np.uint8)
-            
-            # 7. 如果输入是灰度图像，转换回灰度
-            if is_grayscale:
-                result = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-            
-            elapsed_time = time.time() - start_time
-            print(f"apply_defog 处理耗时: {elapsed_time:.4f} 秒")
-            return result
-            
-        except Exception as e:
-            print(f"透雾算法处理出错: {e}")
-            elapsed_time = time.time() - start_time
-            print(f"apply_defog 处理耗时: {elapsed_time:.4f} 秒")
-            # 返回原始图像，确保类型正确
-            if is_grayscale and len(image.shape) == 3:
-                return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+            dark = get_dark_channel(img)
+            A = estimate_atmospheric_light(img, dark, top_percent=0.001)
+            t = estimate_transmission(img, A, omega=omega)
+            t = guided_filter(img, t, guided_filter_radius, guided_filter_eps)
+            J = recover_image(img, t, A, t_floor=t_min)
+            J = np.clip(J, 0.0, 1.0)
+
+            # ---- 还原到原始量程 & dtype ----
+            if orig_dtype == np.uint16:
+                out3 = (J * in_scale + 0.5).astype(np.uint16)
+            elif orig_dtype == np.uint8:
+                out3 = (J * 255.0 + 0.5).astype(np.uint8)
             else:
-                return image.astype(np.uint8) if image.dtype != np.uint8 else image
+                # float：维持 float32，同量程（0~in_scale）方便后续处理
+                out3 = (J * in_scale).astype(np.float32)
+
+            out = cv2.cvtColor(out3, cv2.COLOR_BGR2GRAY) if is_grayscale else out3
+
+            print(f"apply_defog 耗时: {time.time() - start_time:.4f}s, dtype={orig_dtype}, in_scale={in_scale}")
+            return out
+
+        except Exception as e:
+            print(f"透雾算法失败: {e}")
+            print(f"apply_defog 耗时: {time.time() - start_time:.4f}s (fallback)")
+            return image  # 保持原始dtype直接返回
