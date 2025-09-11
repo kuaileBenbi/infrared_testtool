@@ -41,8 +41,8 @@ except ImportError:
 class CameraFunctions:
     """相机功能类，包含所有相机控制和图像处理功能"""
 
-    def __init__(self):
-
+    def __init__(self, ui=None):
+        self.ui = ui
         self.init_param()
 
         # 视频源线程
@@ -87,6 +87,7 @@ class CameraFunctions:
         self.manual_saving = False  # 手动保存标志
         self.adjust_enabled = False
         self.denoise_enabled = False
+        self.stretch_enabled = False
 
         # 变量初始化
         self.blind_mask = None  # 盲元表存储
@@ -249,7 +250,12 @@ class CameraFunctions:
         width = structure.get_value("width")
         height = structure.get_value("height")
         frame = np.frombuffer(map_info.data, dtype=np.uint16).reshape(height, width)
-        print(f"min: {frame.min()}, max: {frame.max()}, mean: {np.mean(frame)}")
+        # print(f"min: {frame.min()}, max: {frame.max()}, mean: {np.mean(frame)}")
+        
+        # 更新图像统计信息到status_frame
+        if hasattr(self, 'ui') and hasattr(self.ui, 'image_stats_label'):
+            stats_text = f"图像统计:\nmin={frame.min()}\nmax={frame.max()}\nmean={np.mean(frame):.1f}"
+            self.ui.image_stats_label.config(text=stats_text)
 
         try:
             self.raw_queue.put_nowait(frame)
@@ -354,6 +360,36 @@ class CameraFunctions:
         if self.bp_correction_enabled and self.blind_mask is not None:
             processed_frame = self.precessor.compensate_with_filter(
                 processed_frame, self.blind_mask
+            )
+        if self.stretch_enabled:
+
+            bit_max = getattr(self, 'bit_max', 4095)
+            
+            # 获取UI参数p
+            if hasattr(self.ui, 'stretch_level_var'):
+                level = self.ui.stretch_level_var.get()
+            else:
+                level = "off"
+                
+            if hasattr(self.ui, 'downsample_var'):
+                downsample = int(self.ui.downsample_var.get())
+            else:
+                downsample = 1
+                
+            if hasattr(self.ui, 'median_ksize_var'):
+                median_ksize = int(self.ui.median_ksize_var.get())
+            else:
+                median_ksize = 3
+            
+            print(f"应用图像拉伸 - 级别: {level}, 下采样: {downsample}, 中值核: {median_ksize}")
+            
+            # 应用拉伸处理
+            processed_frame = self.precessor.stretch_u16(
+                image=processed_frame,
+                max_val=bit_max,
+                downsample=downsample,
+                level=level,
+                median_ksize=median_ksize
             )
 
         if self.adjust_enabled:
@@ -813,6 +849,16 @@ class CameraFunctions:
         if self.offline_image_mode and self.offline_image is not None:
             self._trigger_offline_reprocess()
 
+    def image_stretch(self):
+        """应用图像拉伸处理"""
+        self.stretch_enabled = not self.stretch_enabled
+        state = "enabled" if self.stretch_enabled else "disabled"
+        print("Info", f"Image stretch {state}")
+
+        # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
+
     def toggle_crosshair(self):
         """切换十字星显示"""
         self.crosshair_enabled = not self.crosshair_enabled
@@ -835,6 +881,7 @@ class CameraFunctions:
         self.enhance_enabled = False
         self.sharpen_enabled = False
         self.denoise_enabled = False
+        self.stretch_enabled = False
 
         self.quadrast_nuc_enabled = False
         self.linear_nuc_enabled = False

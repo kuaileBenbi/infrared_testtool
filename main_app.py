@@ -10,6 +10,99 @@ import numpy as np
 from PIL import Image, ImageTk
 from collections import deque
 from tkinter import filedialog
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.font_manager as fm
+
+# 配置matplotlib中文字体
+def setup_matplotlib_chinese_font():
+    """设置matplotlib中文字体"""
+    # 获取系统中可用的字体
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+    
+    # 按优先级选择中文字体，优先选择支持中文的字体
+    chinese_candidates = [
+        'WenQuanYi Micro Hei',      # 文泉驿微米黑
+        'WenQuanYi Zen Hei',        # 文泉驿正黑
+        'Noto Sans CJK SC',         # 思源黑体
+        'Noto Sans CJK',            # 思源黑体
+        'Source Han Sans SC',       # 思源黑体
+        'Source Han Sans CN',       # 思源黑体
+        'SimHei',                   # 黑体
+        'Microsoft YaHei',          # 微软雅黑
+        'SimSun',                   # 宋体
+        'FangSong',                 # 仿宋
+        'KaiTi',                    # 楷体
+        'fangsong ti',              # 系统中发现的字体
+        'song ti',                  # 系统中发现的字体
+        'mincho',                   # 系统中发现的字体
+        'clearlyu',                 # 系统中发现的字体
+        'DejaVu Sans',
+        'Liberation Sans', 
+        'Arial Unicode MS'
+    ]
+    
+    # 直接使用已知支持中文的字体，避免测试过程
+    selected_font = None
+    
+    # 优先选择已知支持中文的字体
+    known_chinese_fonts = [
+        'Noto Sans CJK JP',         # 系统中发现的字体
+        'Noto Serif CJK JP',        # 系统中发现的字体
+        'WenQuanYi Micro Hei',
+        'WenQuanYi Zen Hei', 
+        'Noto Sans CJK SC',
+        'Noto Sans CJK',
+        'Source Han Sans SC',
+        'Source Han Sans CN',
+        'SimHei',
+        'Microsoft YaHei',
+        'SimSun',
+        'FangSong',
+        'KaiTi'
+    ]
+    
+    for candidate in known_chinese_fonts:
+        if candidate in available_fonts:
+            selected_font = candidate
+            break
+    
+    # 如果没找到已知的中文字体，尝试系统字体
+    if selected_font is None:
+        system_fonts = ['fangsong ti', 'song ti', 'mincho', 'clearlyu']
+        for candidate in system_fonts:
+            if candidate in available_fonts:
+                selected_font = candidate
+                break
+    
+    # 最后回退到DejaVu Sans
+    if selected_font is None:
+        selected_font = 'DejaVu Sans'
+        print("警告: 未找到支持中文的字体，使用DejaVu Sans")
+    
+    # 设置matplotlib字体
+    plt.rcParams['font.size'] = 10
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    plt.rcParams['figure.autolayout'] = True  # 自动调整布局
+    
+    # 设置字体回退列表，确保中文字符能正确显示
+    if selected_font in known_chinese_fonts:
+        # 如果选择了已知的中文字体，设置完整的回退列表
+        font_fallback = [selected_font, 'DejaVu Sans', 'Arial', 'sans-serif']
+    else:
+        # 如果选择了系统字体，添加更多中文字体作为回退
+        font_fallback = [selected_font, 'Noto Sans CJK JP', 'DejaVu Sans', 'Arial', 'sans-serif']
+    
+    # 设置字体族和回退列表
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = font_fallback
+    
+    print(f"matplotlib使用字体: {selected_font}")
+    print(f"字体回退列表: {font_fallback}")
+    return selected_font
+
+# 初始化matplotlib字体
+setup_matplotlib_chinese_font()
 
 from ui_config import UIConfig
 from camera_functions import CameraFunctions
@@ -25,7 +118,7 @@ class CameraApp:
         self.ui = UIConfig(root)
 
         # 初始化相机功能
-        self.camera_func = CameraFunctions()
+        self.camera_func = CameraFunctions(self.ui)
 
         # 数据源状态
         self.data_source_running = False
@@ -47,6 +140,9 @@ class CameraApp:
 
         # 重写离线图片重新处理方法
         self.camera_func._trigger_offline_reprocess = self.process_offline_image
+        
+        # 记住上次打开的文件夹路径
+        self.last_folder_path = os.getcwd()
 
         # 设置翻转回调函数
         self.ui.flip_callback = self.on_flip_mode_changed
@@ -93,7 +189,16 @@ class CameraApp:
         self.ui.img_denoise_btn.config(command=self.camera_func.img_denoise)
         self.ui.correction_bw_btn.config(command=self.camera_func.correction_bw)
         self.ui.toggle_crosshair_btn.config(command=self.camera_func.toggle_crosshair)
+        self.ui.show_histogram_btn.config(command=self.show_histogram)
         self.ui.clear_roi_btn.config(command=self.clear_roi_markers)
+        
+        # 图像质量评价功能
+        self.ui.calculate_clarity_btn.config(command=self.calculate_image_clarity)
+        self.ui.calculate_brightness_btn.config(command=self.calculate_image_brightness)
+        self.ui.clear_quality_btn.config(command=self.clear_quality_metrics)
+        
+        # 图像拉伸功能
+        self.ui.apply_stretch_btn.config(command=self.camera_func.image_stretch)
 
         # 数据源控制
         self.ui.start_stop_btn.config(command=self.on_start_stop_click)
@@ -102,24 +207,31 @@ class CameraApp:
     def load_file(self):
         """加载校正文件"""
         filepath = filedialog.askopenfilename(
-            initialdir=os.getcwd(),
+            initialdir=self.last_folder_path,
             title="选择要加载的文件",
             filetypes=[("所有文件", "*.*")],
         )
         if not filepath:
             return  # 用户取消
+        
+        # 更新记住的文件夹路径
+        self.last_folder_path = os.path.dirname(filepath)
+        
         print(f"加载校正文件: {filepath}")
         self.camera_func.whonpz = filepath
 
     def load_bp_file(self):
         """加载坏点文件"""
         filepath = filedialog.askopenfilename(
-            initialdir=os.getcwd(),
+            initialdir=self.last_folder_path,
             title="选择坏点文件",
             filetypes=[("NPZ文件", "*.npz"), ("所有文件", "*.*")],
         )
         if not filepath:
             return  # 用户取消
+
+        # 更新记住的文件夹路径
+        self.last_folder_path = os.path.dirname(filepath)
 
         self.camera_func.bp_npz_path = filepath
         print(f"成功加载坏点文件: {filepath}")
@@ -127,7 +239,7 @@ class CameraApp:
     def load_local_image(self):
         """加载本地图像"""
         filepath = filedialog.askopenfilename(
-            initialdir=os.getcwd(),
+            initialdir=self.last_folder_path,
             title="选择要加载的图像",
             filetypes=[
                 ("图像文件", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif"),
@@ -144,7 +256,12 @@ class CameraApp:
         try:
             # 使用OpenCV加载图像
             image = cv2.imread(filepath, -1)
-            print(image.mean())
+            # print(image.mean())
+            
+            # 更新图像统计信息到status_frame
+            if hasattr(self.ui, 'image_stats_label'):
+                stats_text = f"图像统计: min={image.min()} max={image.max()} mean={image.mean():.1f}"
+                self.ui.image_stats_label.config(text=stats_text)
             if image is None:
                 print(f"无法加载图像: {filepath}")
                 return
@@ -169,6 +286,9 @@ class CameraApp:
             # 直接进行预处理和显示，不放入队列
             self.process_offline_image()
 
+            # 更新记住的文件夹路径
+            self.last_folder_path = os.path.dirname(filepath)
+            
             print(f"成功加载本地图像: {filepath}")
             print(f"图像尺寸: {image.shape}")
             print("图像已设置为离线模式，可重复进行校正处理")
@@ -682,6 +802,250 @@ class CameraApp:
             if total_time > 0:
                 fps_calc = frame_count / total_time
                 self.ui.display_fps_label.config(text=f"当前帧率：{fps_calc:.2f} FPS")
+
+    def show_histogram(self):
+        """显示当前图像的直方图 - 使用matplotlib独立窗口"""
+        if self.camera_func.current_frame is None:
+            print("没有可用的图像数据")
+            return
+        
+        # 确保matplotlib字体配置正确
+        setup_matplotlib_chinese_font()
+        
+        # 获取当前图像
+        image = self.camera_func.current_frame
+        
+        # 创建matplotlib图形窗口
+        plt.ion()  # 开启交互模式
+        fig = plt.figure(figsize=(12, 8))
+        
+        # 创建单个子图用于柱状直方图
+        ax = plt.subplot(1, 1, 1)
+        
+        # 根据图像类型绘制直方图
+        if len(image.shape) == 3:
+            # 彩色图像 - 绘制彩色直方图
+            self._draw_color_histogram_standalone(ax, image)
+        else:
+            # 灰度图像 - 绘制灰度直方图
+            self._draw_gray_histogram_standalone(ax, image)
+        
+        # 调整布局
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.95)  # 为标题留出空间
+        
+        # 显示matplotlib窗口
+        plt.show(block=False)  # 非阻塞显示
+        
+        print("直方图窗口已打开")
+
+    def _draw_gray_histogram_standalone(self, ax, image):
+        """绘制灰度直方图 - 独立窗口版本"""
+        # 确保图像是灰度图
+        if len(image.shape) == 3:
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_image = image
+        
+        # 计算直方图
+        hist = cv2.calcHist([gray_image], [0], None, [256], [0, 256])
+        hist = hist.flatten()
+        
+        # 绘制柱状直方图
+        ax.bar(range(256), hist, color='#A23B72', alpha=0.7, width=1.0)
+        
+        ax.set_xlabel('灰度值', fontsize=12, fontweight='bold')
+        ax.set_ylabel('像素数量', fontsize=12, fontweight='bold')
+        ax.set_title('灰度直方图', fontsize=14, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_xlim(0, 255)
+        ax.set_ylim(0, hist.max() * 1.05)  # 留一点顶部空间
+        
+        # 计算统计信息
+        mean_val = np.mean(gray_image)
+        std_val = np.std(gray_image)
+        min_val = np.min(gray_image)
+        max_val = np.max(gray_image)
+        median_val = np.median(gray_image)
+        peak_idx = np.argmax(hist)
+        peak_value = hist[peak_idx]
+        dynamic_range = max_val - min_val
+        
+        # 在直方图上标记统计信息
+        ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, alpha=0.8, label=f'均值: {mean_val:.1f}')
+        ax.axvline(median_val, color='green', linestyle='--', linewidth=2, alpha=0.8, label=f'中位数: {median_val:.1f}')
+        ax.axvline(peak_idx, color='orange', linestyle='--', linewidth=2, alpha=0.8, label=f'峰值: {peak_idx}')
+        ax.legend(loc='upper right', fontsize=10)
+        
+        # 添加统计信息
+        stats_text = f'''图像统计信息:
+        
+图像尺寸: {gray_image.shape[1]} × {gray_image.shape[0]} 像素
+总像素数: {gray_image.size:,}
+
+灰度统计:
+• 最小值: {min_val}
+• 最大值: {max_val}
+• 均值: {mean_val:.2f}
+• 中位数: {median_val:.2f}
+• 标准差: {std_val:.2f}
+• 动态范围: {dynamic_range}
+
+直方图信息:
+• 峰值位置: {peak_idx}
+• 峰值像素数: {peak_value:,.0f}
+• 非零灰度级: {np.count_nonzero(hist)}'''
+        
+        ax.text(1.02, 0.98, stats_text, transform=ax.transAxes, 
+                verticalalignment='top', fontsize=9, 
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+
+    def _draw_color_histogram_standalone(self, ax, image):
+        """绘制彩色直方图 - 独立窗口版本"""
+        # 分离BGR通道
+        b, g, r = cv2.split(image)
+        colors = ['blue', 'green', 'red']
+        channels = [b, g, r]
+        channel_names = ['蓝色 (B)', '绿色 (G)', '红色 (R)']
+        
+        # 计算各通道直方图
+        hists = []
+        for channel in channels:
+            hist = cv2.calcHist([channel], [0], None, [256], [0, 256])
+            hists.append(hist.flatten())
+        
+        # 绘制柱状彩色直方图
+        width = 0.8
+        x = np.arange(256)
+        for i, (hist, color) in enumerate(zip(hists, colors)):
+            ax.bar(x + i * width/3, hist, width/3, color=color, alpha=0.7, label=channel_names[i])
+        
+        ax.set_xlabel('像素值', fontsize=12, fontweight='bold')
+        ax.set_ylabel('像素数量', fontsize=12, fontweight='bold')
+        ax.set_title('彩色直方图 (柱状)', fontsize=14, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_xlim(0, 255)
+        
+        # 设置Y轴范围
+        max_hist = max([h.max() for h in hists])
+        ax.set_ylim(0, max_hist * 1.05)
+        
+        ax.legend(loc='upper right', fontsize=10)
+        
+        # 计算彩色图像统计信息
+        stats_text = f'''图像统计信息:
+        
+图像尺寸: {image.shape[1]} × {image.shape[0]} 像素
+总像素数: {image.size:,}
+通道数: {image.shape[2]}
+
+各通道统计:'''
+        
+        for i, (channel, name) in enumerate(zip(channels, channel_names)):
+            mean_val = np.mean(channel)
+            std_val = np.std(channel)
+            min_val = np.min(channel)
+            max_val = np.max(channel)
+            peak_idx = np.argmax(hists[i])
+            
+            stats_text += f'''
+{name}:
+• 范围: {min_val} - {max_val}
+• 均值: {mean_val:.2f}
+• 标准差: {std_val:.2f}
+• 峰值: {peak_idx}'''
+        
+        ax.text(1.02, 0.98, stats_text, transform=ax.transAxes, 
+                verticalalignment='top', fontsize=9,
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+
+    def calculate_image_clarity(self):
+        """计算图像清晰度指标"""
+        if self.camera_func.current_frame is None:
+            print("没有可用的图像数据")
+            return
+        
+        try:
+            # 获取当前图像
+            image = self.camera_func.current_frame
+            
+            # 确保图像是灰度图
+            if len(image.shape) == 3:
+                gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray_image = image
+            
+            # 计算拉普拉斯算子（清晰度指标）
+            laplacian = cv2.Laplacian(gray_image, cv2.CV_64F)
+            clarity_score = laplacian.var()
+            
+            # 计算梯度幅值（另一种清晰度指标）
+            grad_x = cv2.Sobel(gray_image, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray_image, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            gradient_score = gradient_magnitude.mean()
+            
+            # 更新状态显示（分行显示）
+            clarity_text = f"图像清晰度: {gradient_score:.2f}"
+            self.ui.image_clarity_label.config(text=clarity_text)
+            
+            print(f"图像清晰度计算完成: {clarity_text}")
+            
+        except Exception as e:
+            print(f"计算图像清晰度时出错: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def calculate_image_brightness(self):
+        """计算图像亮度指标"""
+        if self.camera_func.current_frame is None:
+            print("没有可用的图像数据")
+            return
+        
+        try:
+            # 获取当前图像和位深参数
+            image = self.camera_func.current_frame
+            bit_max = getattr(self.camera_func, 'bit_max', 4095)  # 默认12位
+            
+            # 确保图像是灰度图
+            if len(image.shape) == 3:
+                gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray_image = image
+            
+            # 计算各种亮度指标（基于实际位深）
+            mean_brightness = np.mean(gray_image)
+            std_brightness = np.std(gray_image)
+            
+            # 计算相对亮度（相对于最大可能值）
+            relative_mean = (mean_brightness / bit_max) * 100
+            relative_std = (std_brightness / bit_max) * 100
+            
+            # 计算亮度均匀性（基于相对标准差）
+            brightness_uniformity = 1.0 / (1.0 + relative_std / relative_mean) if relative_mean > 0 else 0
+            
+            # 更新状态显示（分行显示）
+            brightness_text = f"图像亮度均匀性: {brightness_uniformity:.3f}"
+            self.ui.image_brightness_label.config(text=brightness_text)
+            
+            print(f"图像亮度计算完成: {brightness_text}")
+            
+        except Exception as e:
+            print(f"计算图像亮度时出错: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def clear_quality_metrics(self):
+        """清除图像质量评价显示"""
+        try:
+            # 清除清晰度和亮度显示
+            self.ui.image_clarity_label.config(text="")
+            self.ui.image_brightness_label.config(text="")
+            
+            print("图像质量评价显示已清除")
+            
+        except Exception as e:
+            print(f"清除图像质量评价时出错: {e}")
 
     def on_closing(self):
         """窗口关闭事件"""

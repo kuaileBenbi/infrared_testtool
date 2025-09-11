@@ -11,6 +11,7 @@
 """
 
 import os
+import time
 import numpy as np
 import cv2
 import logging
@@ -23,6 +24,7 @@ import numpy as np
 
 TOL_factor = 0.01
 pixel_type = np.uint16
+Level = ["off", "light", "medium", "strong"]
 
 
 logger = logging.getLogger(__name__)
@@ -46,16 +48,28 @@ class ImagePreprocessor:
             raise ValueError(f"ImagePreprocessor load failed: {e}")
 
     def linear_corr(self, raw_frame, nuc_dict, bit_max):
+        start_time = time.time()
         a_map, b_map, ga, gb = nuc_dict["a_map"], nuc_dict["b_map"], nuc_dict["ga"], nuc_dict["gb"]
-        return self.apply_linear_calibration(raw_frame, a_map, b_map, ga, gb, bit_max)
+        result = self.apply_linear_calibration(raw_frame, a_map, b_map, ga, gb, bit_max)
+        elapsed_time = time.time() - start_time
+        print(f"linear_corr 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def quadrast_corr(self, raw_frame, nuc_dict, bit_max):
+        start_time = time.time()
         a2_arr, a1_arr, a0_arr = nuc_dict["a2"], nuc_dict["a1"], nuc_dict["a0"]
-        return self.apply_quadratic_correction(raw_frame, a2_arr, a1_arr, a0_arr, bit_max)
+        result = self.apply_quadratic_correction(raw_frame, a2_arr, a1_arr, a0_arr, bit_max)
+        elapsed_time = time.time() - start_time
+        print(f"quadrast_corr 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def dw_nuc(self, raw_frame, nuc_dict, bit_max):
+        start_time = time.time()
         gain_map, offset_map, ref = nuc_dict["gain_map"], nuc_dict["offset_map"], nuc_dict["ref"]
-        return self.apply_dw_nuc(raw_frame, gain_map, offset_map, ref, bit_max)
+        result = self.apply_dw_nuc(raw_frame, gain_map, offset_map, ref, bit_max)
+        elapsed_time = time.time() - start_time
+        print(f"dw_nuc 处理耗时: {elapsed_time:.4f} 秒")
+        return result
     
     def apply_quadratic_correction(
         self,
@@ -148,28 +162,45 @@ class ImagePreprocessor:
 
 
     def apply_dw_nuc(self, raw, gain_map, offset_map, ref, bit_max):
+        start_time = time.time()
         # print(f"raw image mean: {raw.mean()}, ref: {ref}")
         corrected = gain_map * raw + offset_map
         corrected = np.clip(corrected, 0, ref)
         # print(f"corrected image mean: {corrected.mean()}")
         corrected = (corrected / ref) * bit_max
         # print(f"corrected image mean: {corrected.mean()}")
-        return corrected.astype(np.uint16)
+        result = corrected.astype(np.uint16)
+        elapsed_time = time.time() - start_time
+        print(f"apply_dw_nuc 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_autogian(self, frame):
+        start_time = time.time()
         # 自动亮度调整：使用自动方法如直方图均衡化来自动优化图像的亮度和对比度。
+        
+        if frame.dtype not in [np.uint8, np.uint16]:
+            if frame.max() > 255:
+                frame = frame.astype(np.uint16)
+            else:
+                frame = frame.astype(np.uint8)
+                
         if frame.ndim == 3:
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             l_clahe = clahe.apply(l)
             lab_clahe = cv2.merge((l_clahe, a, b))
-            return cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+            result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         else:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            return clahe.apply(frame)
+            result = clahe.apply(frame)
+        
+        elapsed_time = time.time() - start_time
+        print(f"apply_autogian 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_manualgain(self, frame, control_mode, value):
+        start_time = time.time()
         if frame.ndim == 2:
             logger.warning("不对灰度图做变换")
             return frame
@@ -186,28 +217,41 @@ class ImagePreprocessor:
 
         v = np.clip(v, 0, 255).astype(hsv.dtype)
         final_hsv = cv2.merge((h, s, v))
-        return cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+        result = cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+        elapsed_time = time.time() - start_time
+        print(f"apply_manualgain 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_manualcontrast(self, frame, alpha):
+        start_time = time.time()
         # alpha：对比度调整因子。0 < alpha < 1 时，对比度会降低；
         # alpha > 1 时，对比度会增加。
         # 默认值为 1，表示不改变对比度
-        return cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
+        result = cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
+        elapsed_time = time.time() - start_time
+        print(f"apply_manualcontrast 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_flip(self, frame, control_mode):
+        start_time = time.time()
         if control_mode == 0:
-            return frame
+            result = frame
         elif control_mode == 1:
-            return cv2.flip(frame, 1)
+            result = cv2.flip(frame, 1)
         elif control_mode == 2:
-            return cv2.flip(frame, 0)
+            result = cv2.flip(frame, 0)
         elif control_mode == 3:
-            return cv2.flip(frame, -1)
+            result = cv2.flip(frame, -1)
         else:
             logger.warning("不存在这种翻转方式,返回原图")
-            return frame
+            result = frame
+        
+        elapsed_time = time.time() - start_time
+        print(f"apply_flip 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_blind_pixel_detect(self, frame, sigma=3, window_size=33):
+        start_time = time.time()
         """
         blind_mask 的值为 True（或 1）：表示该位置的像素是盲元。
         """
@@ -234,9 +278,13 @@ class ImagePreprocessor:
         blind_mask[half:-half, half:-half] = mask
 
         self.blind_mask = blind_mask
-        return blind_mask.astype(np.uint16)
+        result = blind_mask.astype(np.uint16)
+        elapsed_time = time.time() - start_time
+        print(f"apply_blind_pixel_detect 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def compensate_with_filter(self, image, blind_mask, ksize: int = 5):
+        start_time = time.time()
         print("坏点查表补偿中....")
 
         k = int(ksize)
@@ -250,10 +298,130 @@ class ImagePreprocessor:
 
         image[blind_mask] = blurred[blind_mask]
 
-        return image.astype(np.uint16)
+        result = image.astype(np.uint16)
+        elapsed_time = time.time() - start_time
+        print(f"compensate_with_filter 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
 
+    def stretch_u16(
+        self,
+        image: np.ndarray,
+        max_val: int,
+        downsample: int,          # 可选：分位数估计下采样（2/4能提速）
+        level: Level = "medium",
+        median_ksize: int = 3,                     # 可选：去噪，中值核（<=1 关闭）
+    ) -> np.ndarray:
+        """
+        对 uint16 图像做分位数拉伸 + γ 调整（按 UI 档位选择力度）。
+        输入:
+            img: HxW 或 HxW x C 的 uint16
+            level: "off" | "light" | "medium" | "strong"
+        输出:
+            与输入同形状的 uint16
+        """
+        start_time = time.time()
+
+        if level == "off":
+            return image
+
+        # —— 档位预设（可按需微调）——
+        if level == "light":
+            q_low, q_high = 0.5, 99.5
+            safe_floor, safe_ceil = 0.0, 1.0
+            min_range = 0.03
+            noise = 0.0
+            gamma_mode = "fixed"
+            gamma, gamma_bounds, adapt_str = 0.9, (0.5, 1.2), 0.5
+        elif level == "medium":
+            q_low, q_high = 0.1, 99.9
+            safe_floor, safe_ceil = 0.005, 0.99
+            min_range = 0.05
+            noise = 0.002
+            gamma_mode = "fixed"
+            gamma, gamma_bounds, adapt_str = 0.8, (0.5, 1.2), 0.5
+        elif level == "strong":
+            q_low, q_high = 0.1, 99.5
+            safe_floor, safe_ceil = 0.005, 0.99 # 0.01, 0.95
+            min_range = 0.15
+            noise = 0.005
+            gamma_mode = "adaptive"
+            gamma, gamma_bounds, adapt_str = 0.4, (0.5, 1.2), 0.5
+        else:
+            raise ValueError(f"unknown level: {level}")
+
+        eps = 1e-6
+
+        # —— 统计域（单通道直接用；多通道用第0通道统计，保证三通道统一风格）——
+        if image.ndim == 2:
+            stat = image
+        else:
+            stat = image[..., 0]
+
+        stat_src = stat
+
+        if downsample and downsample > 1 and stat_src.ndim == 2:
+            h, w = stat_src.shape
+            stat_src = cv2.resize(stat_src, (w // downsample, h // downsample), interpolation=cv2.INTER_AREA)
+
+        # 中值滤波（用于统计的预去噪）
+        if median_ksize and median_ksize > 1:
+            k = median_ksize if (median_ksize % 2 == 1) else (median_ksize + 1)
+            # 注意：cv2.medianBlur 需要2D；若用了 ROI 下采样后仍是2D
+            if stat_src.ndim == 2:
+                stat_src = cv2.medianBlur(stat_src, ksize=k)
+
+        # —— 分位数估计 + 保护 —— 
+        lo = float(np.percentile(stat_src, q_low))
+        hi = float(np.percentile(stat_src, q_high))
+        safe_min = max(lo, max_val * safe_floor)
+        safe_max = min(hi, max_val * safe_ceil)
+        valid_range = max(safe_max - safe_min, max_val * min_range, eps)
+
+        # —— 自适应 γ（仅 strong 使用）——
+        if gamma_mode == "adaptive":
+            # 预览均值（使用统计域）
+            prev = (stat_src.astype(np.float32) - safe_min + max_val * noise) / valid_range
+            prev = np.clip(prev, 0.0, 1.0)
+            avg = float(prev.mean()) if prev.size > 0 else 0.5
+            adj_gamma = gamma * (1.0 + adapt_str * (0.5 - avg))
+            adj_gamma = float(np.clip(adj_gamma, gamma_bounds[0], gamma_bounds[1]))
+        else:
+            adj_gamma = gamma
+        
+        print(f"lo: {lo}, hi: {hi}, safe_min: {safe_min}, safe_max: {safe_max}, valid_range: {valid_range}, adj_gamma: {adj_gamma}")
+
+        # —— 构建 LUT（uint16→uint16），然后套在所有通道 —— 
+        x = np.arange(max_val + 1, dtype=np.float32)
+        y = (x - safe_min + max_val * noise) / valid_range
+        np.clip(y, 0.0, 1.0, out=y)
+        y = np.power(y, adj_gamma) * max_val
+        lut = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
+
+        # 使用numpy索引操作替代cv2.LUT（因为cv2.LUT不支持16位）
+        # 先裁剪图像像素值到LUT的有效范围内，避免索引越界
+        image_min, image_max = stat_src.min(), stat_src.max()
+        if image_max > max_val:
+            print(f"警告：图像像素值超出范围 [{image_min}, {image_max}]，将裁剪到 [0, {max_val}]")
+        image_clipped = np.clip(stat_src, 0, max_val)
+        
+        if image.ndim == 2:
+            out = lut[image_clipped]
+        else:
+            # 对每个通道套同一 LUT，保持风格一致
+            out = np.zeros_like(image)
+            for c in range(image.shape[2]):
+                out[..., c] = lut[image_clipped[..., c]]
+
+        # 计算并输出耗时
+        elapsed_time = time.time() - start_time
+        print(f"stretch_u16 处理耗时: {elapsed_time:.4f} 秒")
+
+        return out
+    
     def process(self, img, gamma=1.0, bit_max=None):
+        start_time = time.time()
+        
         if bit_max is None:
             return img
         t = img.astype(np.float32)
@@ -266,46 +434,138 @@ class ImagePreprocessor:
         # 阈值
         lo = np.percentile(t, 100 * TOL_factor)
         hi = np.percentile(t, 100 * (1 - TOL_factor))
+        print(f"lo: {lo}, hi: {hi}")
         # 矢量化拉伸
         t = self.imadjust_vec(t, lo, hi, 0, bit_max, gamma=gamma)
         np.clip(t, 0, bit_max, out=t)
+                
+        # 计算并输出耗时
+        elapsed_time = time.time() - start_time
+        print(f"process 处理耗时: {elapsed_time:.4f} 秒")
+
+        self.scale_to_gamma_alpha(img, bit_max)
+        self.scale_midway(img, bit_max)
+        
         return t.astype(np.uint16)
 
     @staticmethod
     def imadjust_vec(x, a, b, c, d, gamma=1.0):
+        print(f"a: {a}, b: {b}, c: {c}, d: {d}, gamma: {gamma}")
         y = (np.clip((x - a) / (b - a), 0, 1) ** gamma) * (d - c) + c
         return y
 
+    def scale_to_gamma_alpha(self, img, img_bit, gamma=0.4, min_range_ratio=0.15):
+        start_time = time.time()
+        t = img.astype(np.float32)
+        # t = cv2.medianBlur(t, ksize=3)
+        t = cv2.medianBlur(t, ksize=3)
+
+        # 计算更稳定的分位数范围 (扩大采样区间)
+        p05, p995 = np.percentile(t, (0.01, 99.9))  # 改用0.5%~99.5%分位数
+
+        # 动态范围保护机制
+        # max_val = (2**14 - 1) << 2  # 理论最大值65532
+        safe_min = max(p05, img_bit * 0.01)  # 最低不低于最大值的1%
+        safe_max = min(p995, img_bit * 0.95)  # 最高不超过最大值的95%
+        valid_range = max(safe_max - safe_min, img_bit * min_range_ratio)
+
+        # 带底噪补偿的拉伸
+        img_stretch = (t - safe_min + img_bit * 0.005) / valid_range  # 添加0.5%底噪补偿
+        img_stretch = np.clip(img_stretch, 0, 1)
+
+        # 自适应gamma调整
+        avg_brightness = np.mean(img_stretch)
+        adj_gamma = gamma * (1 + 0.5 * (0.5 - avg_brightness))  # 根据亮度微调gamma
+        img_gamma = np.power(img_stretch, np.clip(adj_gamma, 0.5, 1.2))
+
+        print(f"p05: {p05}, p995: {p995}, safe_min: {safe_min}, safe_max: {safe_max}, valid_range: {valid_range}, avg_brightness: {avg_brightness}, adj_gamma: {adj_gamma}")
+
+        img_16bit = img_gamma * img_bit
+        np.clip(img_16bit, 0, img_bit, out=img_16bit)
+
+        result = img_16bit.astype(np.uint16)
+        elapsed_time = time.time() - start_time
+        print(f"scale_to_gamma_alpha 处理耗时: {elapsed_time:.4f} 秒")
+        return result
+
+
+    def scale_midway(self, img, img_bit, gamma=0.8, min_range_ratio=0.05):
+        start_time = time.time()
+        t = img.astype(np.float32)
+        t = cv2.medianBlur(t, ksize=3)
+
+        # 使用更宽松的分位数
+        p01, p999 = np.percentile(t, (0.1, 99.9))
+
+        # 动态范围保护（比 scale_to_gamma_alpha 宽一些）
+        safe_min = max(p01, img_bit * 0.005)  # 允许接近0
+        safe_max = min(p999, img_bit * 0.99)  # 允许接近最大值
+        valid_range = max(safe_max - safe_min, img_bit * min_range_ratio)
+
+        # 拉伸 + 底噪补偿
+        img_stretch = (t - safe_min + img_bit * 0.002) / valid_range
+        img_stretch = np.clip(img_stretch, 0, 1)
+
+        # 轻量 gamma 调整（不随亮度强烈变化）
+        img_gamma = np.power(img_stretch, gamma)
+
+        print(f"p01: {p01}, p999: {p999}, safe_min: {safe_min}, safe_max: {safe_max}, valid_range: {valid_range}")
+
+        img_16bit = img_gamma * img_bit
+        np.clip(img_16bit, 0, img_bit, out=img_16bit)
+        result = img_16bit.astype(np.uint16)
+        elapsed_time = time.time() - start_time
+        print(f"scale_midway 处理耗时: {elapsed_time:.4f} 秒")
+        return result
+
     def apply_denoise(self, image):
+        start_time = time.time()
         # 引导滤波降噪
+        image = image.astype(np.float32)
         img_medianblur = cv2.medianBlur(image, 3)
-        return cv2.ximgproc.guidedFilter(
+        result = cv2.ximgproc.guidedFilter(
             img_medianblur, image, radius=9, eps=0.01, dDepth=-1
         )
+        elapsed_time = time.time() - start_time
+        print(f"apply_denoise 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_whitebalance(self, image, method="SimpleWB"):
+        start_time = time.time()
         """对可见光图像进行白平衡"""
         if method == "GrayworldWB":
             wb = cv2.xphoto.createGrayworldWB()
-            return wb.balanceWhite(image)
+            result = wb.balanceWhite(image)
         elif method == "SimpleWB":
             wb = cv2.xphoto.createSimpleWB()
             wb.setWBCoeffs(cv2.cvtColor(image, cv2.COLOR_BGR2XYZ))  # 设置白平衡系数
-            return wb.balanceWhite(image)
+            result = wb.balanceWhite(image)
+        else:
+            result = image
+        
+        elapsed_time = time.time() - start_time
+        print(f"apply_whitebalance 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def apply_sharping(self, image):
+        start_time = time.time()
         if image.ndim == 3:
             yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
             y, u, v = cv2.split(yuv)
             blurred = cv2.GaussianBlur(y, (7, 7), 1.5)
             y_sharp = cv2.addWeighted(y, 1.5, blurred, -0.5, 0)
             sharpened = cv2.merge((y_sharp, u, v))
-            return cv2.cvtColor(sharpened, cv2.COLOR_YUV2BGR)
+            result = cv2.cvtColor(sharpened, cv2.COLOR_YUV2BGR)
         else:
             blurred = cv2.GaussianBlur(image, (7, 7), 1.5)
-            return cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
+            result = cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
+        
+        elapsed_time = time.time() - start_time
+        print(f"apply_sharping 处理耗时: {elapsed_time:.4f} 秒")
+        return result
 
     def draw_center_cross_polylines(self, image, color=(255, 255, 255), thickness=5):
+        start_time = time.time()
         """
         使用polylines高效绘制十字线
         :param cross_radius: 十字线半径（从中心到端点的距离）
@@ -342,4 +602,6 @@ class ImagePreprocessor:
             color=color,
             thickness=thickness,
         )
+        elapsed_time = time.time() - start_time
+        print(f"draw_center_cross_polylines 处理耗时: {elapsed_time:.4f} 秒")
         return image
