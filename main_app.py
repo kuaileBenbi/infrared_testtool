@@ -187,6 +187,7 @@ class CameraApp:
         self.ui.img_imadjust_btn.config(command=self.camera_func.img_imadjust)
         self.ui.image_sharpen_btn.config(command=self.camera_func.image_sharpen)
         self.ui.img_denoise_btn.config(command=self.camera_func.img_denoise)
+        self.ui.img_defog_btn.config(command=self.camera_func.image_defog)
         self.ui.correction_bw_btn.config(command=self.camera_func.correction_bw)
         self.ui.toggle_crosshair_btn.config(command=self.camera_func.toggle_crosshair)
         self.ui.show_histogram_btn.config(command=self.show_histogram)

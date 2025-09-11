@@ -88,6 +88,7 @@ class CameraFunctions:
         self.adjust_enabled = False
         self.denoise_enabled = False
         self.stretch_enabled = False
+        self.defog_enabled = False
 
         # 变量初始化
         self.blind_mask = None  # 盲元表存储
@@ -391,18 +392,21 @@ class CameraFunctions:
                 level=level,
                 median_ksize=median_ksize
             )
-
-        if self.adjust_enabled:
-            processed_frame = self.precessor.process(processed_frame, gamma=1.0, bit_max=self.bit_max)
-
+        
         if self.denoise_enabled:
             processed_frame = self.precessor.apply_denoise(processed_frame)
+        
+        if self.adjust_enabled:
+            processed_frame = self.precessor.process(processed_frame, gamma=1.0, bit_max=self.bit_max)
 
         if self.enhance_enabled:
             processed_frame = self.precessor.apply_autogian(processed_frame)
 
         if self.sharpen_enabled:
             processed_frame = self.precessor.apply_sharping(processed_frame)
+
+        if self.defog_enabled:
+            processed_frame = self.precessor.apply_defog(processed_frame)
 
         return processed_frame
 
@@ -854,6 +858,16 @@ class CameraFunctions:
         self.stretch_enabled = not self.stretch_enabled
         state = "enabled" if self.stretch_enabled else "disabled"
         print("Info", f"Image stretch {state}")
+
+        # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
+
+    def image_defog(self):
+        """透雾处理"""
+        self.defog_enabled = not self.defog_enabled
+        state = "enabled" if self.defog_enabled else "disabled"
+        print("Info", f"Image defog {state}")
 
         # 如果是离线图片模式，重新处理图片
         if self.offline_image_mode and self.offline_image is not None:

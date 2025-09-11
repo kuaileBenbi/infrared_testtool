@@ -693,6 +693,9 @@ class UIConfig:
         self.img_denoise_btn = tk.Button(enhance_frame, text="图像去噪", font=self.button_font)
         self.img_denoise_btn.pack(fill=tk.X, pady=2)
 
+        self.img_defog_btn = tk.Button(enhance_frame, text="透雾处理", font=self.button_font)
+        self.img_defog_btn.pack(fill=tk.X, pady=2)
+
     def create_pixel_control_frame(self):
         """创建像素控制框架"""
         # ROI控制
