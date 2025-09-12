@@ -678,6 +678,10 @@ class UIConfig:
         self.apply_stretch_btn = tk.Button(stretch_frame, text="应用拉伸", font=self.button_font)
         self.apply_stretch_btn.pack(fill=tk.X, pady=2)
 
+        # 自适应拉伸按钮
+        self.adaptive_stretch_btn = tk.Button(stretch_frame, text="自适应拉伸", font=self.button_font)
+        self.adaptive_stretch_btn.pack(fill=tk.X, pady=2)
+
         # 图像增强
         enhance_frame = tk.LabelFrame(
             self.basic_processing_col, text="图像增强", padx=5, pady=5

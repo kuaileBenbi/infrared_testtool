@@ -192,7 +192,7 @@ class ImagePreprocessor:
             lab_clahe = cv2.merge((l_clahe, a, b))
             result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         else:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(4, 4))
             result = clahe.apply(frame)
         
         elapsed_time = time.time() - start_time
@@ -304,6 +304,150 @@ class ImagePreprocessor:
         return result
 
 
+    def stretch_u16_adaptive(
+        self,
+        image: np.ndarray,
+        max_val: int,
+        downsample: int = 2,      # 建议2或4做分位估计加速；=1 关闭
+        median_ksize: int = 3,    # 统计前中值去噪；<=1 关闭
+        print_debug: bool = False
+    ) -> np.ndarray:
+        """
+        分段自适应 uint16 拉伸（稳健动态范围分段 + 自适应 γ）。
+        输入:
+            image: HxW 或 HxW x C 的 uint16 图像（12/14/16位都可，但需要传对 max_val）
+            max_val: 满量程（例如 4095/16383/65535）
+            downsample: 分位统计的下采样倍数
+            median_ksize: 统计与可选全图中值去噪核（奇数）
+        输出:
+            与输入同形状的 uint16
+        """
+        start_time = time.time()
+        eps = 1e-6
+
+        if image.dtype != np.uint16:
+            raise TypeError("image 必须为 uint16")
+
+        # —— 统计域（单通道直接用，多通道用第0通道，保证三通道统一风格）——
+        if image.ndim == 2:
+            stat = image
+        else:
+            stat = image[..., 0]
+
+        stat_src = stat
+        if downsample and downsample > 1 and stat_src.ndim == 2:
+            h, w = stat_src.shape
+            stat_src = cv2.resize(
+                stat_src, (max(1, w // downsample), max(1, h // downsample)),
+                interpolation=cv2.INTER_AREA
+            )
+
+        # —— 统计前中值去噪；可选对整图做一次中值去噪（红外弱信号时有帮助）——
+        if median_ksize and median_ksize > 1:
+            k = median_ksize if (median_ksize % 2 == 1) else (median_ksize + 1)
+            if stat_src.ndim == 2:
+                stat_src = cv2.medianBlur(stat_src, ksize=k)
+                # 若你只想让统计更稳，不想改动原图，可注释下一行：
+                # 对整图也做一次同核的中值去噪（可视需要保留/去掉）
+                image = cv2.medianBlur(image, ksize=k)
+
+        # —— 稳健动态范围（避免极端像素干扰）——
+        # 用 0.1% 与 99.9% 分位作为 robust min/max
+        rb_lo = float(np.percentile(stat_src, 0.1))
+        rb_hi = float(np.percentile(stat_src, 99.9))
+        rb_range = max(rb_hi - rb_lo, eps)
+
+        # —— 动态范围分段（单位：灰度级，绝对门限）——
+        # <256, 256–512, 512–1024, 1024–2048, >2048
+        if rb_range < 256:
+            seg = "tiny"
+        elif rb_range < 512:
+            seg = "small"
+        elif rb_range < 1024:
+            seg = "mid"
+        elif rb_range < 2048:
+            seg = "large"
+        else:
+            seg = "huge"
+
+        # —— 各分段参数表 —— 
+        # 说明：
+        # - q_low/q_high：用于估计安全上下限的分位点（越“收敛”越抗噪）
+        # - safe_floor/safe_ceil：对安全上下限做满量程约束(比例)，避免过度扩展
+        # - min_range：有效范围的最小下限（按满量程比例）。越大 => 拉伸更保守。
+        # - noise：在归一化前加一点点偏置，抑制暗噪点导致的过度增益。
+        # - gamma_mode='adaptive'：对 γ 做轻微自适应，依据统计域的亮度均值调整。
+        #   adj_gamma = base_gamma * (1 + adapt_str*(0.5 - avg))
+        #   avg 为映射到 [0,1] 的预览均值（根据 safe_min/safe_max/valid_range 算）
+        params_table = {
+            "tiny":  dict(q_low=5.0,   q_high=99.8, safe_floor=0.010, safe_ceil=0.990,
+                          min_range=0.020, noise=0.0018, gamma_mode="adaptive",
+                          base_gamma=0.60, gamma_bounds=(0.40, 1.00), adapt_str=0.60),
+            "small": dict(q_low=1.0,   q_high=99.8, safe_floor=0.008, safe_ceil=0.990,
+                          min_range=0.030, noise=0.0015, gamma_mode="adaptive",
+                          base_gamma=0.70, gamma_bounds=(0.50, 1.10), adapt_str=0.55),
+            "mid":   dict(q_low=0.5,   q_high=99.5, safe_floor=0.005, safe_ceil=0.990,
+                          min_range=0.050, noise=0.0010, gamma_mode="adaptive",
+                          base_gamma=0.80, gamma_bounds=(0.60, 1.20), adapt_str=0.50),
+            "large": dict(q_low=0.2,   q_high=99.8, safe_floor=0.003, safe_ceil=0.995,
+                          min_range=0.080, noise=0.0008, gamma_mode="adaptive",
+                          base_gamma=0.95, gamma_bounds=(0.70, 1.30), adapt_str=0.40),
+            "huge":  dict(q_low=0.1,   q_high=99.9, safe_floor=0.000, safe_ceil=1.000,
+                          min_range=0.120, noise=0.0005, gamma_mode="adaptive",
+                          base_gamma=1.05, gamma_bounds=(0.80, 1.40), adapt_str=0.30),
+        }
+        P = params_table[seg]
+
+        # —— 分位数安全上下限（在该分段策略下重算）——
+        lo = float(np.percentile(stat_src, P["q_low"]))
+        hi = float(np.percentile(stat_src, P["q_high"]))
+
+        safe_min = max(lo, max_val * P["safe_floor"])
+        safe_max = min(hi, max_val * P["safe_ceil"])
+        valid_range = max(safe_max - safe_min, max_val * P["min_range"], eps)
+
+        # —— 自适应 γ —— 
+        if P["gamma_mode"] == "adaptive":
+            prev = (stat_src.astype(np.float32) - safe_min + max_val * P["noise"]) / valid_range
+            prev = np.clip(prev, 0.0, 1.0)
+            avg = float(prev.mean()) if prev.size > 0 else 0.5
+            adj_gamma = P["base_gamma"] * (1.0 + P["adapt_str"] * (0.5 - avg))
+            adj_gamma = float(np.clip(adj_gamma, P["gamma_bounds"][0], P["gamma_bounds"][1]))
+        else:
+            adj_gamma = P["base_gamma"]
+
+        if print_debug:
+            print(f"[adaptive-stretch] seg={seg}  rb_range={rb_range:.1f}  "
+                  f"lo/hi={lo:.1f}/{hi:.1f}  safe_min/max={safe_min:.1f}/{safe_max:.1f}  "
+                  f"valid_range={valid_range:.1f}  gamma={adj_gamma:.3f}")
+
+        # —— 构建 LUT（uint16→uint16），然后套到所有通道 —— 
+        x = np.arange(max_val + 1, dtype=np.float32)
+        y = (x - safe_min + max_val * P["noise"]) / valid_range
+        np.clip(y, 0.0, 1.0, out=y)
+        y = np.power(y, adj_gamma) * max_val
+        lut = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
+
+        # —— 应用 LUT —— 
+        image_min, image_max = image.min(), image.max()
+        if image_max > max_val and print_debug:
+            print(f"警告：图像像素值超出范围 [{image_min}, {image_max}]，将裁剪到 [0, {max_val}]")
+
+        image_clipped = np.clip(image, 0, max_val)
+        if image.ndim == 2:
+            out = lut[image_clipped]
+        else:
+            out = np.empty_like(image)
+            # 对每个通道套同一 LUT，保持风格一致
+            for c in range(image.shape[2]):
+                out[..., c] = lut[image_clipped[..., c]]
+
+        if print_debug:
+            elapsed = time.time() - start_time
+            print(f"stretch_u16_adaptive 处理耗时: {elapsed:.4f} 秒")
+
+        return out
+    
     def stretch_u16(
         self,
         image: np.ndarray,
@@ -338,7 +482,7 @@ class ImagePreprocessor:
             safe_floor, safe_ceil = 0.005, 0.99
             min_range = 0.05
             noise = 0.001 # 0.001–0.002
-            gamma_mode = "fixed"
+            gamma_mode = "adaptive"
             gamma, gamma_bounds, adapt_str = 0.8, (0.5, 1.2), 0.5
         elif level == "strong":
             q_low, q_high = 0.1, 99.5
@@ -384,9 +528,13 @@ class ImagePreprocessor:
             # 预览均值（使用统计域）
             prev = (stat_src.astype(np.float32) - safe_min + max_val * noise) / valid_range
             prev = np.clip(prev, 0.0, 1.0)
+
             avg = float(prev.mean()) if prev.size > 0 else 0.5
+            print(f"avg: {avg}")
             adj_gamma = gamma * (1.0 + adapt_str * (0.5 - avg))
+            print(f"adj_gamma: {adj_gamma}")
             adj_gamma = float(np.clip(adj_gamma, gamma_bounds[0], gamma_bounds[1]))
+
         else:
             adj_gamma = gamma
         
@@ -549,21 +697,75 @@ class ImagePreprocessor:
         return result
 
     def apply_sharping(self, image):
+
         start_time = time.time()
-        if image.ndim == 3:
-            yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
-            y, u, v = cv2.split(yuv)
-            blurred = cv2.GaussianBlur(y, (7, 7), 1.5)
-            y_sharp = cv2.addWeighted(y, 1.5, blurred, -0.5, 0)
-            sharpened = cv2.merge((y_sharp, u, v))
-            result = cv2.cvtColor(sharpened, cv2.COLOR_YUV2BGR)
+
+        # —— 配置：可按需微调（已给出较稳的默认值）——
+        amount = 1.5          # 锐化强度（1.2~1.8常用）
+        radius_small = 1      # 小尺度半径（kernel=3）
+        radius_large = 3      # 大尺度半径（kernel=7）
+        thr_rel = 0.003       # 相对阈值(满量程比例)，抑制噪声（红外可 0.003~0.006）
+        multiscale = True     # 是否进行多尺度叠加（更锐利仍然很快）
+        work_in_y = True      # 彩色图只在Y通道锐化，避免色偏
+
+        # —— dtype & 满量程 —— 
+        orig_dtype = image.dtype
+        if np.issubdtype(orig_dtype, np.integer):
+            max_val = np.iinfo(orig_dtype).max
         else:
-            blurred = cv2.GaussianBlur(image, (7, 7), 1.5)
-            result = cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
-        
+            vmax = float(np.max(image)) if image.size else 1.0
+            max_val = vmax if vmax > 1.0 else 1.0
+
+        thr_abs = float(thr_rel) * float(max_val)
+
+        def _box_blur(src_f32, r: int):
+            k = 2 * r + 1
+            return cv2.boxFilter(src_f32, ddepth=-1, ksize=(k, k),
+                                normalize=True, borderType=cv2.BORDER_REPLICATE)
+
+        def _usm_once(src_f32, r: int, amt: float, thr_abs_: float):
+            blur = _box_blur(src_f32, r)
+            mask = src_f32 - blur
+            if thr_abs_ > 0:
+                np.putmask(mask, np.abs(mask) < thr_abs_, 0.0)  # 硬阈值，快
+            dst = src_f32 + amt * mask
+            # 过冲保护：夹到3x3局部最小/最大，减少光晕
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            lo = cv2.erode(src_f32, kernel)
+            hi = cv2.dilate(src_f32, kernel)
+            dst = np.minimum(np.maximum(dst, lo), hi)
+            return dst
+
+        def _sharpen_single_channel(ch):
+            ch_f = ch.astype(np.float32)
+            if multiscale:
+                s1 = _usm_once(ch_f, radius_small, amount * 0.85, thr_abs)
+                s2 = _usm_once(ch_f, radius_large, amount * 0.35, thr_abs * 0.5)
+                out = 0.7 * s1 + 0.3 * s2
+            else:
+                out = _usm_once(ch_f, radius_small, amount, thr_abs)
+            out = np.clip(out, 0, max_val)
+            return out.astype(orig_dtype)
+
+        if image.ndim == 2:  # 灰度（如红外 uint16）
+            result = _sharpen_single_channel(image)
+        else:                # 彩色（BGR）
+            if work_in_y:
+                yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+                y, u, v = cv2.split(yuv)
+                y_sharp = _sharpen_single_channel(y)
+                result = cv2.cvtColor(cv2.merge((y_sharp, u, v)), cv2.COLOR_YUV2BGR)
+            else:
+                b, g, r = cv2.split(image)
+                b = _sharpen_single_channel(b)
+                g = _sharpen_single_channel(g)
+                r = _sharpen_single_channel(r)
+                result = cv2.merge((b, g, r))
+
         elapsed_time = time.time() - start_time
         print(f"apply_sharping 处理耗时: {elapsed_time:.4f} 秒")
         return result
+
 
     def draw_center_cross_polylines(self, image, color=(255, 255, 255), thickness=5):
         start_time = time.time()
@@ -607,44 +809,52 @@ class ImagePreprocessor:
         print(f"draw_center_cross_polylines 处理耗时: {elapsed_time:.4f} 秒")
         return image
 
-    def apply_defog(self, image, t_min=0.1, omega=0.95, guided_filter_radius=40, guided_filter_eps=1e-3, in_max=None):
+    def apply_defog(
+        self,
+        image,
+        t_min=0.12,                  # 略提高下限，减少过度去雾导致变暗
+        omega=0.90,                  # 略降低去雾强度
+        guided_filter_radius=20,     # 半径调小，+ 透射率降采样，整体更快
+        guided_filter_eps=1e-3,
+        in_max=None,
+        # ---- 新增：加速与稳态选项 ----
+        fast_ds=2,                   # 透射率在 1/fast_ds 分辨率估计
+        blend_power=0.5,             # 混合权重指数，越小越“温和”
+        blend_min=0.15,              # 最小混合权重
+        blend_max=0.85,              # 最大混合权重
+        do_exposure_comp=True,       # 去雾后做一次全局曝光匹配
+        comp_p=0.75,                 # 用第 p 分位数做匹配，0.6~0.85 均可
+        comp_clip=(0.8, 1.25)        # 增益裁剪范围，避免过度提亮/压暗
+    ):
         """
-        透雾算法 - 基于暗通道先验的去雾算法
-        :param image: 输入图像 (BGR格式或灰度图)
-        :param t_min: 透射率的最小值，防止过度去雾
-        :param omega: 保留雾气的比例，0-1之间
-        :param guided_filter_radius: 引导滤波半径
-        :param guided_filter_eps: 引导滤波正则化参数
-        :return: 去雾后的图像
+        暗通道去雾（IR灰度/三通道；保持原始dtype与量程；快速&不易变黑）
         """
+        import time, cv2, numpy as np
         start_time = time.time()
-        
-        orig_dtype = image.dtype
-        is_grayscale = (image.ndim == 2)
 
-        # ---- 统一为3通道参与计算，输出再还原 ----
-        if is_grayscale:
+        orig_dtype = image.dtype
+        is_gray = (image.ndim == 2)
+
+        # ---- 构造 3 通道参与计算（灰度不做颜色增强，只是走流程）----
+        if is_gray:
             img3 = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         else:
             img3 = image
-
         img3 = img3.astype(np.float32)
 
         # ---- 识别/设定输入满量程 ----
         def _auto_in_max(arr_u16):
-            vmax = int(arr_u16.max())
-            # 常见有效位宽就近上限（保留“头部空间”，避免把没打满的图压得过亮）
-            if vmax <= 4095:   return 4095.0   # 12-bit
-            if vmax <= 16383:  return 16383.0  # 14-bit
-            return 65535.0                     # 16-bit（默认）
+            vmax = int(arr_u16.max()) if arr_u16.size else 0
+            if vmax <= 4095:  return 4095.0   # 12-bit
+            if vmax <= 16383: return 16383.0  # 14-bit
+            return 65535.0                    # 16-bit 默认
         if in_max is None:
             if orig_dtype == np.uint16:
                 in_scale = _auto_in_max(image)
             elif orig_dtype == np.uint8:
                 in_scale = 255.0
             else:
-                # float 输入：按当前最大值近似为满量程，至少防零
-                cur_max = float(np.max(img3)) if img3.size else 1.0
+                cur_max = float(img3.max()) if img3.size else 1.0
                 in_scale = max(cur_max, 1.0)
         else:
             in_scale = float(in_max)
@@ -653,11 +863,11 @@ class ImagePreprocessor:
         img = np.clip(img3 / max(in_scale, 1.0), 0.0, 1.0)
 
         # ---- 内部函数 ----
-        def get_dark_channel(im, patch_size=15):
-            k = max(3, int(patch_size) | 1)  # 奇数核
-            min_channel = np.min(im, axis=2)
+        def get_dark_channel(im, patch=15):
+            k = max(3, int(patch) | 1)
+            min_c = np.min(im, axis=2)
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-            return cv2.erode(min_channel, kernel)
+            return cv2.erode(min_c, kernel)
 
         def estimate_atmospheric_light(im, dark, top_percent=0.001):
             h, w = im.shape[:2]
@@ -668,21 +878,20 @@ class ImagePreprocessor:
             A = cand[np.argmax(np.linalg.norm(cand, axis=1))]
             return np.maximum(A, 1e-3)
 
-        def estimate_transmission(im, A, omega=0.95):
+        def estimate_transmission(im, A, omega_=0.95, patch=15):
             normalized = im / (A[None, None, :] + 1e-6)
-            dark_norm = get_dark_channel(normalized)
-            return 1.0 - omega * dark_norm
+            dark_norm = get_dark_channel(normalized, patch)
+            return 1.0 - omega_ * dark_norm
 
         def guided_filter(guide_rgb, src, radius, eps):
-            # guide/src 已在[0,1]，不再 /255
             guide = guide_rgb
             if guide.ndim == 3:
                 guide = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY)
-            guide = guide.astype(np.float32)
+            guide = guide.astype(np.float32)  # 已在[0,1]
             src = src.astype(np.float32)
 
             k = int(radius)
-            k = (2*k + 1, 2*k + 1)  # 以“半径”定义窗口
+            k = (2*k + 1, 2*k + 1)  # 半径->窗口
             mean_g  = cv2.boxFilter(guide, -1, k, normalize=True)
             mean_s  = cv2.boxFilter(src,   -1, k, normalize=True)
             mean_gs = cv2.boxFilter(guide * src, -1, k, normalize=True)
@@ -697,34 +906,59 @@ class ImagePreprocessor:
             mean_b = cv2.boxFilter(b, -1, k, normalize=True)
             return mean_a * guide + mean_b
 
-        def recover_image(im, t, A, t_floor=0.1):
-            t = np.clip(np.nan_to_num(t, nan=1.0, posinf=1.0, neginf=1.0), t_floor, 0.999)
-            J = (im - A[None, None, :]) / t[..., None] + A[None, None, :]
-            return J
+        # ---- 1) 暗通道（全分辨率）----
+        dark_full = get_dark_channel(img, patch=15)
 
-        try:
-            dark = get_dark_channel(img)
-            A = estimate_atmospheric_light(img, dark, top_percent=0.001)
-            t = estimate_transmission(img, A, omega=omega)
-            t = guided_filter(img, t, guided_filter_radius, guided_filter_eps)
-            J = recover_image(img, t, A, t_floor=t_min)
-            J = np.clip(J, 0.0, 1.0)
+        # ---- 2) 大气光（全分辨率top0.1%）----
+        A = estimate_atmospheric_light(img, dark_full, top_percent=0.001)
 
-            # ---- 还原到原始量程 & dtype ----
-            if orig_dtype == np.uint16:
-                out3 = (J * in_scale + 0.5).astype(np.uint16)
-            elif orig_dtype == np.uint8:
-                out3 = (J * 255.0 + 0.5).astype(np.uint8)
-            else:
-                # float：维持 float32，同量程（0~in_scale）方便后续处理
-                out3 = (J * in_scale).astype(np.float32)
+        # ---- 3) 透射率：低分辨率估计 -> 上采样 -> 引导滤波细化（更快）----
+        if fast_ds and fast_ds > 1:
+            H, W = img.shape[:2]
+            h, w = (H + fast_ds - 1) // fast_ds, (W + fast_ds - 1) // fast_ds
+            img_lr = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            # patch 与半径随分辨率缩放
+            patch_lr = max(3, (15 // fast_ds) | 1)
+            t_lr = estimate_transmission(img_lr, A, omega_=omega, patch=patch_lr)
+            t0 = cv2.resize(t_lr, (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            t0 = estimate_transmission(img, A, omega_=omega, patch=15)
 
-            out = cv2.cvtColor(out3, cv2.COLOR_BGR2GRAY) if is_grayscale else out3
+        t0 = np.clip(t0, 0.0, 1.0)
+        t = guided_filter(img, t0, guided_filter_radius, guided_filter_eps)
+        t = np.nan_to_num(t, nan=1.0, posinf=1.0, neginf=1.0)
 
-            print(f"apply_defog 耗时: {time.time() - start_time:.4f}s, dtype={orig_dtype}, in_scale={in_scale}")
-            return out
+        # ---- 4) 恢复图像（广播，无循环）----
+        t_clip = np.clip(t, t_min, 0.999)
+        J = (img - A[None, None, :]) / t_clip[..., None] + A[None, None, :]
 
-        except Exception as e:
-            print(f"透雾算法失败: {e}")
-            print(f"apply_defog 耗时: {time.time() - start_time:.4f}s (fallback)")
-            return image  # 保持原始dtype直接返回
+        # ---- 5) 自适应“柔性去雾”：按 t 做混合，避免晴朗区域被过度处理 ----
+        # w = clamp( (1 - t)^blend_power , blend_min, blend_max )
+        w = np.clip((1.0 - t) ** float(blend_power), float(blend_min), float(blend_max))
+        # 对灰度而言三通道等同；对可见光也能生效
+        J_soft = w[..., None] * J + (1.0 - w)[..., None] * img
+
+        # ---- 6) 曝光匹配（分位数）以避免整体偏暗 ----
+        Jx = J_soft
+        if do_exposure_comp:
+            # 用分位数（默认 75%）在[0,1]域做一次全局增益
+            q_src = np.quantile(img,  comp_p)
+            q_dst = np.quantile(Jx,   comp_p)
+            gain = q_src / max(q_dst, 1e-6)
+            gmin, gmax = comp_clip
+            gain = float(np.clip(gain, gmin, gmax))
+            Jx = np.clip(Jx * gain, 0.0, 1.0)
+
+        # ---- 7) 回写原量程 & dtype ----
+        if orig_dtype == np.uint16:
+            out3 = (Jx * in_scale + 0.5).astype(np.uint16)
+        elif orig_dtype == np.uint8:
+            out3 = (Jx * 255.0 + 0.5).astype(np.uint8)
+        else:
+            out3 = (Jx * in_scale).astype(np.float32)
+
+        out = cv2.cvtColor(out3, cv2.COLOR_BGR2GRAY) if is_gray else out3
+
+        print(f"apply_defog 耗时: {time.time() - start_time:.4f}s | dtype={orig_dtype} | in_scale={in_scale} | ds={fast_ds}")
+        return out
+

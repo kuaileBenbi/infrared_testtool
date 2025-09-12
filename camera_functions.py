@@ -88,6 +88,7 @@ class CameraFunctions:
         self.adjust_enabled = False
         self.denoise_enabled = False
         self.stretch_enabled = False
+        self.adaptive_stretch_enabled = False
         self.defog_enabled = False
 
         # 变量初始化
@@ -391,6 +392,31 @@ class CameraFunctions:
                 downsample=downsample,
                 level=level,
                 median_ksize=median_ksize
+            )
+
+        if self.adaptive_stretch_enabled:
+            bit_max = getattr(self, 'bit_max', 4095)
+            
+            # 获取UI参数
+            if hasattr(self.ui, 'downsample_var'):
+                downsample = int(self.ui.downsample_var.get())
+            else:
+                downsample = 2  # 自适应拉伸默认下采样为2
+                
+            if hasattr(self.ui, 'median_ksize_var'):
+                median_ksize = int(self.ui.median_ksize_var.get())
+            else:
+                median_ksize = 3  # 自适应拉伸默认中值核为3
+            
+            print(f"应用自适应拉伸 - 下采样: {downsample}, 中值核: {median_ksize}")
+            
+            # 应用自适应拉伸处理
+            processed_frame = self.precessor.stretch_u16_adaptive(
+                image=processed_frame,
+                max_val=bit_max,
+                downsample=downsample,
+                median_ksize=median_ksize,
+                print_debug=True
             )
         
         if self.denoise_enabled:
@@ -863,6 +889,16 @@ class CameraFunctions:
         if self.offline_image_mode and self.offline_image is not None:
             self._trigger_offline_reprocess()
 
+    def adaptive_stretch(self):
+        """应用自适应拉伸处理"""
+        self.adaptive_stretch_enabled = not self.adaptive_stretch_enabled
+        state = "enabled" if self.adaptive_stretch_enabled else "disabled"
+        print("Info", f"Adaptive stretch {state}")
+
+        # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
+
     def image_defog(self):
         """透雾处理"""
         self.defog_enabled = not self.defog_enabled
@@ -896,6 +932,8 @@ class CameraFunctions:
         self.sharpen_enabled = False
         self.denoise_enabled = False
         self.stretch_enabled = False
+        self.adaptive_stretch_enabled = False
+        self.defog_enabled = False
 
         self.quadrast_nuc_enabled = False
         self.linear_nuc_enabled = False

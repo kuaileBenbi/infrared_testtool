@@ -200,6 +200,7 @@ class CameraApp:
         
         # 图像拉伸功能
         self.ui.apply_stretch_btn.config(command=self.camera_func.image_stretch)
+        self.ui.adaptive_stretch_btn.config(command=self.camera_func.adaptive_stretch)
 
         # 数据源控制
         self.ui.start_stop_btn.config(command=self.on_start_stop_click)
