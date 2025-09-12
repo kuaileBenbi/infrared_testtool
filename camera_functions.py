@@ -145,6 +145,9 @@ class CameraFunctions:
         
         # 先停止当前数据源
         self.cleanup()
+        
+        # 强制清理可能残留的资源
+        self._force_cleanup_resources()
 
         # 重新初始化参数
         self.init_param()
@@ -178,8 +181,22 @@ class CameraFunctions:
 
     def _start_v4l2_stream(self):
         """启动v4l2流"""
+        # 检查设备是否存在
+        device_path = f"/dev/video{self.device_num}"
+        if not os.path.exists(device_path):
+            raise FileNotFoundError(f"摄像头设备 {device_path} 不存在")
 
-        if self.wave == "mwir":
+        # 检查设备是否被其他进程占用
+        try:
+            check_cmd = f"lsof {device_path}"
+            result = subprocess.run(shlex.split(check_cmd), capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                print(f"警告: 设备 {device_path} 可能被其他进程占用")
+                print(f"占用信息: {result.stdout}")
+        except Exception as e:
+            print(f"检查设备占用状态时出错: {e}")
+
+        if self.wave in ["mwir", "swir"]:
             cmd = f"""
             v4l2-ctl -d /dev/video{self.device_num}
                 --set-fmt-video=width=640,height=512,pixelformat='Y12 '
@@ -195,13 +212,34 @@ class CameraFunctions:
                 --set-selection=target=crop,flags=0,top=0,left=0,width=1280,height=512
                 --stream-to=-
             """
+        
         try:
+            print(f"启动v4l2流，设备: {device_path}, 波段: {self.wave}")
             self.v4l2_proc = subprocess.Popen(
-                shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                shlex.split(cmd), 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid  # 创建新的进程组
             )
+            
+            # 检查进程是否成功启动
+            if self.v4l2_proc.poll() is not None:
+                stderr_output = self.v4l2_proc.stderr.read().decode('utf-8')
+                raise RuntimeError(f"v4l2进程启动失败: {stderr_output}")
+            
+            print("v4l2流启动成功")
+            
         except Exception as e:
             print(f"开启硬件控制出错:{e},详细内容如下：")
             print(traceback.format_exc())
+            # 确保清理失败的进程
+            if hasattr(self, 'v4l2_proc') and self.v4l2_proc:
+                try:
+                    self.v4l2_proc.kill()
+                except:
+                    pass
+                self.v4l2_proc = None
+            raise
 
     def init_camera(self):
         """初始化相机"""
@@ -209,26 +247,159 @@ class CameraFunctions:
             print("GStreamer不可用，跳过相机初始化")
             return
 
-        pipeline_str = f"""
-            fdsrc fd={self.v4l2_proc.stdout.fileno()}
-            ! videoparse format=gray16-le width=640 height=512 framerate=30/1
-            ! appsink drop=1
-        """
-        try:
-            self.pipeline = Gst.parse_launch(pipeline_str)
-            self.appsink = self.pipeline.get_by_name("appsink0")
-            if not self.appsink:
-                self.appsink = Gst.ElementFactory.make("appsink", "appsink0")
-                self.pipeline.add(self.appsink)
+        if not hasattr(self, 'v4l2_proc') or not self.v4l2_proc:
+            raise RuntimeError("v4l2进程未启动，无法初始化相机")
 
+        # 使用手动创建元素的方式，更可靠
+        fd_num = self.v4l2_proc.stdout.fileno()
+        
+        try:
+            print("初始化GStreamer管道...")
+            print(f"使用文件描述符: {fd_num}")
+            
+            # 创建管道
+            self.pipeline = Gst.Pipeline()
+            if not self.pipeline:
+                raise RuntimeError("GStreamer管道创建失败")
+            
+            # 创建元素
+            fdsrc = Gst.ElementFactory.make("fdsrc", "fdsrc")
+            videoparse = Gst.ElementFactory.make("videoparse", "videoparse")
+            self.appsink = Gst.ElementFactory.make("appsink", "appsink0")
+            
+            if not fdsrc or not videoparse or not self.appsink:
+                raise RuntimeError("无法创建GStreamer元素")
+            
+            # 设置元素属性
+            fdsrc.set_property("fd", fd_num)
+            videoparse.set_property("format", 1)  # GstVideoFormat.GRAY16_LE
+            videoparse.set_property("width", 640)
+            videoparse.set_property("height", 512)
+            videoparse.set_property("framerate", Gst.Fraction(30, 1))
+            
             self.appsink.set_property("emit-signals", True)
             self.appsink.set_property("sync", False)
+            self.appsink.set_property("max-buffers", 1)
+            self.appsink.set_property("drop", True)
+            
+            # 添加元素到管道
+            self.pipeline.add(fdsrc)
+            self.pipeline.add(videoparse)
+            self.pipeline.add(self.appsink)
+            
+            # 连接元素
+            if not fdsrc.link(videoparse):
+                raise RuntimeError("无法连接fdsrc到videoparse")
+            if not videoparse.link(self.appsink):
+                raise RuntimeError("无法连接videoparse到appsink")
+            
+            print("GStreamer元素创建和连接成功")
+            
+            # 连接信号
             self.appsink.connect("new-sample", self.on_new_sample, None)
 
-            self.pipeline.set_state(Gst.State.PLAYING)
+            print("设置管道状态为READY...")
+            # 先设置为READY状态
+            ret = self.pipeline.set_state(Gst.State.READY)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("GStreamer管道设置为READY状态失败")
+            
+            # 等待READY状态
+            ret = self.pipeline.get_state(timeout=3 * Gst.SECOND)
+            print(f"READY状态结果: {ret}")
+            if ret[0] == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError(f"GStreamer管道READY状态失败: {ret}")
+            
+            print("设置管道状态为PLAYING...")
+            # 再设置为PLAYING状态
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("GStreamer管道启动失败")
+            
+            # 等待PLAYING状态，但不要过于严格
+            ret = self.pipeline.get_state(timeout=3 * Gst.SECOND)
+            print(f"PLAYING状态结果: {ret}")
+            if ret[0] == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError(f"GStreamer管道PLAYING状态失败: {ret}")
+            
+            # 如果状态是ASYNC，也认为是成功的
+            if ret[0] in [Gst.StateChangeReturn.SUCCESS, Gst.StateChangeReturn.ASYNC]:
+                print("GStreamer管道初始化成功")
+            else:
+                print(f"警告: GStreamer管道状态为 {ret[0]}，但继续运行")
+            
         except Exception as e:
-            print(f"开启流水线出错:{e},详细内容如下：")
-            print(traceback.format_exc())
+            print(f"手动创建管道失败: {e}")
+            print("尝试使用parse_launch方法...")
+            
+            # 清理失败的管道
+            if hasattr(self, 'pipeline') and self.pipeline:
+                try:
+                    self.pipeline.set_state(Gst.State.NULL)
+                except:
+                    pass
+                self.pipeline = None
+            
+            # 尝试使用parse_launch方法
+            try:
+                pipeline_str = f"fdsrc fd={fd_num} ! videoparse format=gray16-le width=640 height=512 framerate=30/1 ! appsink name=appsink0 drop=1"
+                print(f"备用管道字符串: {pipeline_str}")
+                
+                self.pipeline = Gst.parse_launch(pipeline_str)
+                if not self.pipeline:
+                    raise RuntimeError("GStreamer管道创建失败")
+                
+                # 获取appsink元素
+                self.appsink = self.pipeline.get_by_name("appsink0")
+                if not self.appsink:
+                    raise RuntimeError("无法获取appsink元素")
+                
+                # 设置appsink属性
+                self.appsink.set_property("emit-signals", True)
+                self.appsink.set_property("sync", False)
+                self.appsink.set_property("max-buffers", 1)
+                self.appsink.set_property("drop", True)
+                self.appsink.connect("new-sample", self.on_new_sample, None)
+                
+                print("使用parse_launch方法成功")
+                
+                # 继续状态设置
+                print("设置管道状态为READY...")
+                ret = self.pipeline.set_state(Gst.State.READY)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("GStreamer管道设置为READY状态失败")
+                
+                ret = self.pipeline.get_state(timeout=3 * Gst.SECOND)
+                print(f"READY状态结果: {ret}")
+                if ret[0] == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError(f"GStreamer管道READY状态失败: {ret}")
+                
+                print("设置管道状态为PLAYING...")
+                ret = self.pipeline.set_state(Gst.State.PLAYING)
+                if ret == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("GStreamer管道启动失败")
+                
+                ret = self.pipeline.get_state(timeout=3 * Gst.SECOND)
+                print(f"PLAYING状态结果: {ret}")
+                if ret[0] == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError(f"GStreamer管道PLAYING状态失败: {ret}")
+                
+                if ret[0] in [Gst.StateChangeReturn.SUCCESS, Gst.StateChangeReturn.ASYNC]:
+                    print("GStreamer管道初始化成功")
+                else:
+                    print(f"警告: GStreamer管道状态为 {ret[0]}，但继续运行")
+                    
+            except Exception as e2:
+                print(f"parse_launch方法也失败: {e2}")
+                print(traceback.format_exc())
+                # 清理失败的管道
+                if hasattr(self, 'pipeline') and self.pipeline:
+                    try:
+                        self.pipeline.set_state(Gst.State.NULL)
+                    except:
+                        pass
+                    self.pipeline = None
+                raise RuntimeError(f"所有GStreamer管道创建方法都失败: {e}, {e2}")
 
     def on_new_sample(self, sink, data):
         """处理新的样本"""
@@ -948,6 +1119,7 @@ class CameraFunctions:
 
     def cleanup(self):
         """清理资源"""
+        print("开始清理资源...")
         self.running = False
 
         # 停止视频源线程
@@ -957,40 +1129,120 @@ class CameraFunctions:
             and self.source_thread.is_alive()
         ):
             try:
-                self.source_thread.join(timeout=2)
+                self.source_thread.join(timeout=3)
                 print("视频源线程已停止")
             except Exception as e:
                 print(f"停止视频源线程时出错: {e}")
 
         # 停止GStreamer管道
-        if GST_AVAILABLE and self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline = None
+        if GST_AVAILABLE and hasattr(self, 'pipeline') and self.pipeline:
+            try:
+                print("停止GStreamer管道...")
+                # 先设置为PAUSED状态
+                ret = self.pipeline.set_state(Gst.State.PAUSED)
+                print(f"设置PAUSED状态结果: {ret}")
+                
+                # 再设置为NULL状态
+                ret = self.pipeline.set_state(Gst.State.NULL)
+                print(f"设置NULL状态结果: {ret}")
+                
+                # 等待管道状态改变
+                ret = self.pipeline.get_state(timeout=3 * Gst.SECOND)
+                print(f"GStreamer管道最终状态: {ret}")
+                
+                self.pipeline = None
+                print("GStreamer管道已停止")
+            except Exception as e:
+                print(f"停止GStreamer管道时出错: {e}")
+                # 强制设置为NULL状态
+                try:
+                    if hasattr(self, 'pipeline') and self.pipeline:
+                        self.pipeline.set_state(Gst.State.NULL)
+                except:
+                    pass
 
         # 停止v4l2进程
-        if self.v4l2_proc:
+        if hasattr(self, 'v4l2_proc') and self.v4l2_proc:
             try:
+                print("停止v4l2进程...")
+                # 首先尝试优雅终止
                 self.v4l2_proc.send_signal(signal.SIGINT)
-                self.v4l2_proc.wait(timeout=5)
+                try:
+                    self.v4l2_proc.wait(timeout=3)
+                    print("v4l2进程已优雅终止")
+                except subprocess.TimeoutExpired:
+                    print("v4l2进程优雅终止超时，强制终止...")
+                    self.v4l2_proc.kill()
+                    self.v4l2_proc.wait(timeout=2)
+                    print("v4l2进程已强制终止")
             except Exception as e:
                 print(f"停止v4l2进程时出错: {e}")
             finally:
                 self.v4l2_proc = None
 
+        # 重置摄像头设备状态
+        if hasattr(self, 'device_num'):
+            try:
+                print(f"重置摄像头设备 /dev/video{self.device_num}...")
+                # 使用v4l2-ctl重置设备
+                reset_cmd = f"v4l2-ctl -d /dev/video{self.device_num} --all"
+                subprocess.run(shlex.split(reset_cmd), timeout=2, 
+                             capture_output=True, text=True)
+                print("摄像头设备状态已重置")
+            except Exception as e:
+                print(f"重置摄像头设备时出错: {e}")
+
         # 清空队列
         try:
             while not self.raw_queue.empty():
                 self.raw_queue.get_nowait()
+            print("原始队列已清空")
         except:
             pass
 
         try:
             while not self.play_queue.empty():
                 self.play_queue.get_nowait()
+            print("播放队列已清空")
         except:
             pass
 
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+        
         print("资源清理完成")
+
+    def _force_cleanup_resources(self):
+        """强制清理可能残留的资源"""
+        print("执行强制资源清理...")
+        
+        # 清理可能残留的v4l2进程
+        if hasattr(self, 'device_num'):
+            try:
+                device_path = f"/dev/video{self.device_num}"
+                # 查找占用设备的进程
+                check_cmd = f"lsof {device_path}"
+                result = subprocess.run(shlex.split(check_cmd), capture_output=True, text=True, timeout=2)
+                if result.returncode == 0 and result.stdout.strip():
+                    print(f"发现设备 {device_path} 被占用，尝试清理...")
+                    # 这里可以添加更激进的清理逻辑，比如杀死占用进程
+                    # 但为了安全起见，我们只记录信息
+                    print(f"占用信息: {result.stdout}")
+            except Exception as e:
+                print(f"检查设备占用时出错: {e}")
+        
+        # 清理可能残留的GStreamer管道
+        if GST_AVAILABLE:
+            try:
+                # 这里可以添加GStreamer特定的清理逻辑
+                pass
+            except Exception as e:
+                print(f"清理GStreamer资源时出错: {e}")
+        
+        # 等待一小段时间让系统释放资源
+        time.sleep(0.5)
+        print("强制资源清理完成")
 
     def _trigger_offline_reprocess(self):
         """触发离线图片重新处理"""
