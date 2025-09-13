@@ -36,6 +36,11 @@ class ImagePreprocessor:
         self.bd_para = None
         self.nuc_para = None
         self.blind_mask = None
+        
+        # 缓存的校正参数，避免每次调用时重复提取
+        self._linear_params = None
+        self._quadratic_params = None
+        self._dw_nuc_params = None
 
     def load_config(self, npz_path):
         try:
@@ -44,12 +49,76 @@ class ImagePreprocessor:
             with np.load(npz_path) as data:
                 self.nuc_para = data["nuc"]
                 self.bd_para = data["bd"]
+                # 加载配置后立即提取和缓存校正参数
+                self._extract_correction_params()
         except Exception as e:
             raise ValueError(f"ImagePreprocessor load failed: {e}")
+    
+    def _extract_correction_params(self):
+        """提取并缓存校正参数，避免每次调用时重复提取"""
+        if self.nuc_para is None:
+            return
+            
+        try:
+            # 提取线性校正参数
+            if all(key in self.nuc_para for key in ["a_map", "b_map", "ga", "gb"]):
+                self._linear_params = {
+                    "a_map": self.nuc_para["a_map"],
+                    "b_map": self.nuc_para["b_map"], 
+                    "ga": self.nuc_para["ga"],
+                    "gb": self.nuc_para["gb"]
+                }
+            
+            # 提取二次校正参数
+            if all(key in self.nuc_para for key in ["a2", "a1", "a0"]):
+                self._quadratic_params = {
+                    "a2": self.nuc_para["a2"],
+                    "a1": self.nuc_para["a1"],
+                    "a0": self.nuc_para["a0"]
+                }
+            
+            # 提取明暗校正参数
+            if all(key in self.nuc_para for key in ["gain_map", "offset_map", "ref"]):
+                self._dw_nuc_params = {
+                    "gain_map": self.nuc_para["gain_map"],
+                    "offset_map": self.nuc_para["offset_map"],
+                    "ref": self.nuc_para["ref"]
+                }
+                
+        except Exception as e:
+            logger.warning(f"提取校正参数时出错: {e}")
+            # 如果提取失败，清空缓存
+            self._linear_params = None
+            self._quadratic_params = None
+            self._dw_nuc_params = None
+    
+    def clear_correction_params_cache(self):
+        """清除校正参数缓存，强制下次调用时重新提取"""
+        self._linear_params = None
+        self._quadratic_params = None
+        self._dw_nuc_params = None
+        logger.info("校正参数缓存已清除")
 
     def linear_corr(self, raw_frame, nuc_dict, bit_max):
         start_time = time.time()
-        a_map, b_map, ga, gb = nuc_dict["a_map"], nuc_dict["b_map"], nuc_dict["ga"], nuc_dict["gb"]
+        
+        # 使用缓存的参数，如果缓存为空则从nuc_dict中提取并缓存
+        if self._linear_params is None:
+            if nuc_dict is not None and all(key in nuc_dict for key in ["a_map", "b_map", "ga", "gb"]):
+                self._linear_params = {
+                    "a_map": nuc_dict["a_map"],
+                    "b_map": nuc_dict["b_map"], 
+                    "ga": nuc_dict["ga"],
+                    "gb": nuc_dict["gb"]
+                }
+            else:
+                raise ValueError("线性校正参数不可用")
+        
+        a_map = self._linear_params["a_map"]
+        b_map = self._linear_params["b_map"]
+        ga = self._linear_params["ga"]
+        gb = self._linear_params["gb"]
+        
         result = self.apply_linear_calibration(raw_frame, a_map, b_map, ga, gb, bit_max)
         elapsed_time = time.time() - start_time
         print(f"linear_corr 处理耗时: {elapsed_time:.4f} 秒")
@@ -57,7 +126,22 @@ class ImagePreprocessor:
 
     def quadrast_corr(self, raw_frame, nuc_dict, bit_max):
         start_time = time.time()
-        a2_arr, a1_arr, a0_arr = nuc_dict["a2"], nuc_dict["a1"], nuc_dict["a0"]
+        
+        # 使用缓存的参数，如果缓存为空则从nuc_dict中提取并缓存
+        if self._quadratic_params is None:
+            if nuc_dict is not None and all(key in nuc_dict for key in ["a2", "a1", "a0"]):
+                self._quadratic_params = {
+                    "a2": nuc_dict["a2"],
+                    "a1": nuc_dict["a1"],
+                    "a0": nuc_dict["a0"]
+                }
+            else:
+                raise ValueError("二次校正参数不可用")
+        
+        a2_arr = self._quadratic_params["a2"]
+        a1_arr = self._quadratic_params["a1"]
+        a0_arr = self._quadratic_params["a0"]
+        
         result = self.apply_quadratic_correction(raw_frame, a2_arr, a1_arr, a0_arr, bit_max)
         elapsed_time = time.time() - start_time
         print(f"quadrast_corr 处理耗时: {elapsed_time:.4f} 秒")
@@ -65,7 +149,22 @@ class ImagePreprocessor:
 
     def dw_nuc(self, raw_frame, nuc_dict, bit_max):
         start_time = time.time()
-        gain_map, offset_map, ref = nuc_dict["gain_map"], nuc_dict["offset_map"], nuc_dict["ref"]
+        
+        # 使用缓存的参数，如果缓存为空则从nuc_dict中提取并缓存
+        if self._dw_nuc_params is None:
+            if nuc_dict is not None and all(key in nuc_dict for key in ["gain_map", "offset_map", "ref"]):
+                self._dw_nuc_params = {
+                    "gain_map": nuc_dict["gain_map"],
+                    "offset_map": nuc_dict["offset_map"],
+                    "ref": nuc_dict["ref"]
+                }
+            else:
+                raise ValueError("明暗校正参数不可用")
+        
+        gain_map = self._dw_nuc_params["gain_map"]
+        offset_map = self._dw_nuc_params["offset_map"]
+        ref = self._dw_nuc_params["ref"]
+        
         result = self.apply_dw_nuc(raw_frame, gain_map, offset_map, ref, bit_max)
         elapsed_time = time.time() - start_time
         print(f"dw_nuc 处理耗时: {elapsed_time:.4f} 秒")
