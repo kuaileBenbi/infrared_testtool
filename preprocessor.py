@@ -954,8 +954,8 @@ class ImagePreprocessor:
         elapsed_time = time.time() - start_time
         print(f"process 处理耗时: {elapsed_time:.4f} 秒")
 
-        self.scale_to_gamma_alpha(img, bit_max)
-        self.scale_midway(img, bit_max)
+        # self.scale_to_gamma_alpha(img, bit_max)
+        # self.scale_midway(img, bit_max)
         
         return t.astype(np.uint16)
 

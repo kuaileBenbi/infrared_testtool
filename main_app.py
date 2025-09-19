@@ -261,9 +261,12 @@ class CameraApp:
             # print(image.mean())
             
             # 更新图像统计信息到status_frame
-            if hasattr(self.ui, 'image_stats_label'):
-                stats_text = f"图像统计: min={image.min()} max={image.max()} mean={image.mean():.1f}"
-                self.ui.image_stats_label.config(text=stats_text)
+            if hasattr(self.ui, 'image_stats_text'):
+                stats_text = f"图像统计:\nmean={image.mean():.1f}\nmin={image.min()}\nmax={image.max()}"
+                self.ui.image_stats_text.config(state="normal")
+                self.ui.image_stats_text.delete(1.0, tk.END)
+                self.ui.image_stats_text.insert(1.0, stats_text)
+                self.ui.image_stats_text.config(state="disabled")
             if image is None:
                 print(f"无法加载图像: {filepath}")
                 return
@@ -357,8 +360,13 @@ class CameraApp:
                 print("保存张数必须大于0")
                 return
 
-            print(f"开始自动保存 {save_count} 张图片，保存间隔 0.03 秒")
-            self.camera_func.auto_save_100(save_count)
+            # 从界面获取保存关键词
+            keyword = self.ui.save_keyword_entry.get().strip()
+            if not keyword:
+                keyword = "auto_images"  # 默认关键词
+
+            print(f"开始自动保存 {save_count} 张图片到文件夹 '{keyword}'，保存间隔 0.03 秒")
+            self.camera_func.auto_save_100(save_count, keyword)
 
         except ValueError:
             print("请输入有效的数字")

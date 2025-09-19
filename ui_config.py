@@ -554,6 +554,15 @@ class UIConfig:
         self.save_count_entry.pack(side=tk.LEFT, padx=5)
         self.save_count_entry.insert(0, "100")  # 默认100张
 
+        # 保存关键词输入
+        save_keyword_frame = tk.Frame(storage_frame)
+        save_keyword_frame.pack(fill=tk.X, pady=2)
+
+        tk.Label(save_keyword_frame, text="保存关键词:", font=self.label_font).pack(side=tk.LEFT)
+        self.save_keyword_entry = tk.Entry(save_keyword_frame, width=15, font=self.text_font)
+        self.save_keyword_entry.pack(side=tk.LEFT, padx=5)
+        self.save_keyword_entry.insert(0, "auto_images")  # 默认关键词
+
         self.auto_save_100_btn = tk.Button(storage_frame, text="自动保存指定张数", font=self.button_font)
         self.auto_save_100_btn.pack(fill=tk.X, pady=2)
 
@@ -800,10 +809,11 @@ class UIConfig:
         self.capture_fps_label.pack(fill=tk.X, pady=2)
 
         # 图像统计信息显示
-        self.image_stats_label = tk.Label(
-            status_frame, text="图像统计: 等待数据...", font=self.status_font, anchor="w"
+        self.image_stats_text = tk.Text(
+            status_frame, height=3, font=self.status_font, wrap="none",
+            relief="solid", bd=1, state="disabled"
         )
-        self.image_stats_label.pack(fill=tk.X, pady=2)
+        self.image_stats_text.pack(fill=tk.X, pady=2)
 
         # 图像清晰度显示
         self.image_clarity_label = tk.Label(

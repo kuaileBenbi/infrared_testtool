@@ -8,6 +8,7 @@ import time
 import traceback
 import cv2
 import numpy as np
+import tkinter as tk
 from PIL import Image, ImageTk
 from collections import deque
 from preprocessor import ImagePreprocessor
@@ -427,9 +428,12 @@ class CameraFunctions:
         # print(f"min: {frame.min()}, max: {frame.max()}, mean: {np.mean(frame)}")
         
         # 更新图像统计信息到status_frame
-        if hasattr(self, 'ui') and hasattr(self.ui, 'image_stats_label'):
-            stats_text = f"图像统计:\nmin={frame.min()}\nmax={frame.max()}\nmean={np.mean(frame):.1f}"
-            self.ui.image_stats_label.config(text=stats_text)
+        if hasattr(self, 'ui') and hasattr(self.ui, 'image_stats_text'):
+            stats_text = f"图像统计:\nmean={np.mean(frame):.1f}\nmin={frame.min()}\nmax={frame.max()}"
+            self.ui.image_stats_text.config(state="normal")
+            self.ui.image_stats_text.delete(1.0, tk.END)
+            self.ui.image_stats_text.insert(1.0, stats_text)
+            self.ui.image_stats_text.config(state="disabled")
 
         try:
             self.raw_queue.put_nowait(frame)
@@ -708,16 +712,16 @@ class CameraFunctions:
             print(f"保存背景图出错:{e},详细内容如下：")
             print(traceback.format_exc)
 
-    def auto_save_100(self, save_count=100):
+    def auto_save_100(self, save_count=100, keyword="auto_images"):
         """自动保存指定张数图片"""
         t = threading.Thread(
-            target=self._auto_save_thread, args=(save_count,), daemon=True
+            target=self._auto_save_thread, args=(save_count, keyword), daemon=True
         )
         t.start()
 
-    def _auto_save_thread(self, save_count):
+    def _auto_save_thread(self, save_count, keyword="auto_images"):
         """自动保存指定张数图片的线程"""
-        folder = "auto_images"
+        folder = os.path.join("auto_images", keyword)
         os.makedirs(folder, exist_ok=True)  # 如果文件夹不存在则创建
 
         count = 0
