@@ -16,6 +16,7 @@ import numpy as np
 import cv2
 import logging
 from numpy.lib.stride_tricks import sliding_window_view
+from typing import Optional, Dict, Any
 
 import scipy.signal as signal
 
@@ -244,6 +245,7 @@ class ImagePreprocessor:
         Returns:
             uint16 校正结果
         """
+        t1 = time.time()
         raw_f = raw.astype(np.float32)
 
         # 增益防护
@@ -257,12 +259,15 @@ class ImagePreprocessor:
             corr = corr * float(global_a) + float(global_b)
 
         corr = np.clip(corr, 0, float(bit_max))
+        t2 = time.time()
+        print(f"apply_linear_calibration 处理耗时: {t2 - t1:.4f} 秒")
         return np.rint(corr).astype(np.uint16)
 
 
     def apply_dw_nuc(self, raw, gain_map, offset_map, ref, bit_max):
         start_time = time.time()
         # print(f"raw image mean: {raw.mean()}, ref: {ref}")
+        raw = raw.astype(np.float32)
         corrected = gain_map * raw + offset_map
         corrected = np.clip(corrected, 0, ref)
         # print(f"corrected image mean: {corrected.mean()}")
@@ -291,7 +296,7 @@ class ImagePreprocessor:
             lab_clahe = cv2.merge((l_clahe, a, b))
             result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
         else:
-            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(4, 4))
+            clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(8, 8))
             result = clahe.apply(frame)
         
         elapsed_time = time.time() - start_time
@@ -407,27 +412,167 @@ class ImagePreprocessor:
         self,
         image: np.ndarray,
         max_val: int,
-        downsample: int = 2,      # 建议2或4做分位估计加速；=1 关闭
-        median_ksize: int = 3,    # 统计前中值去噪；<=1 关闭
-        print_debug: bool = False
+        downsample: int = 2,  # 分位统计下采样
+        median_ksize: int = 3,  # 统计前中值去噪；<=1 关闭
+        print_debug: bool = False,
+        video_state: Optional[Dict[str, Any]] = None,  # 跨帧稳态上下文：{} / None
+        config: Optional[Dict[str, Any]] = None,  # 覆盖默认稳态参数
     ) -> np.ndarray:
         """
-        分段自适应 uint16 拉伸（稳健动态范围分段 + 自适应 γ）。
-        输入:
-            image: HxW 或 HxW x C 的 uint16 图像（12/14/16位都可，但需要传对 max_val）
-            max_val: 满量程（例如 4095/16383/65535）
-            downsample: 分位统计的下采样倍数
-            median_ksize: 统计与可选全图中值去噪核（奇数）
-        输出:
-            与输入同形状的 uint16
+        分段自适应 uint16 拉伸（稳健动态范围分段 + 自适应γ）。
+        - 单帧模式: video_state=None
+        - 视频模式: 提供一个可变的 video_state=dict即可自动启用防闪烁稳
+
+        返回：与输入同形状的 uint16
         """
-        start_time = time.time()
+        logger = logging.getLogger(__name__)
+        t0 = time.time()
         eps = 1e-6
 
         if image.dtype != np.uint16:
             raise TypeError("image 必须为 uint16")
 
-        # —— 统计域（单通道直接用，多通道用第0通道，保证三通道统一风格）——
+        # ---------- 工具函数（内部） ----------
+        def _hist_u16(img_u16: np.ndarray, _max: int, bins: int) -> np.ndarray:
+            h, _ = np.histogram(img_u16, bins=bins, range=(0, _max + 1))
+            return h.astype(np.float32)
+
+        def _pct_from_hist(H: np.ndarray, q: float, _max: int, bins: int) -> float:
+            # q ∈ [0,100]
+            cdf = np.cumsum(H, dtype=np.float64)
+            s = cdf[-1] + 1e-12
+            p = q / 100.0
+            idx = int(np.searchsorted(cdf, p * s))
+            if idx <= 0:
+                return 0.0
+            if idx >= bins:
+                return float(_max)
+            bin_w = (_max + 1) / bins
+            return idx * bin_w
+
+        def _hist_bhat_dist(
+            H1: Optional[np.ndarray], H2: Optional[np.ndarray]
+        ) -> float:
+            if H1 is None or H2 is None:
+                return 0.0
+            h1 = H1 / (H1.sum() + 1e-6)
+            h2 = H2 / (H2.sum() + 1e-6)
+            bc = float(np.sum(np.sqrt(h1 * h2)))
+            return float(np.sqrt(max(1e-12, 1.0 - bc)))
+
+        def _decide_segment(
+            R: float, prev_seg: Optional[str], upf: float, dnf: float
+        ) -> str:
+            if prev_seg is None:
+                if R < 256:
+                    return "tiny"
+                if R < 512:
+                    return "small"
+                if R < 1024:
+                    return "mid"
+                if R < 2048:
+                    return "large"
+                return "huge"
+            s = prev_seg
+            if s == "tiny":
+                return "small" if R >= 256 * upf else "tiny"
+            if s == "small":
+                if R >= 512 * upf:
+                    return "mid"
+                if R < 256 * dnf:
+                    return "tiny"
+                return "small"
+            if s == "mid":
+                if R >= 1024 * upf:
+                    return "large"
+                if R < 512 * dnf:
+                    return "small"
+                return "mid"
+            if s == "large":
+                if R >= 2048 * upf:
+                    return "huge"
+                if R < 1024 * dnf:
+                    return "mid"
+                return "large"
+            if s == "huge":
+                return "large" if R < 2048 * dnf else "huge"
+
+        def _limit_step(
+            prev: Optional[float], cur: float, d_abs: float, d_rel: float
+        ) -> float:
+            if prev is None:
+                return float(cur)
+            max_step = max(d_abs, abs(prev) * d_rel)
+            return float(np.clip(cur, prev - max_step, prev + max_step))
+
+        def _ema(prev: Optional[float], cur: float, a: float) -> float:
+            return float(cur) if prev is None else float((1 - a) * prev + a * cur)
+
+        # ---------- 分段参数表（与你原来一致） ----------
+        params_table = {
+            "tiny": dict(
+                q_low=5.0,
+                q_high=99.8,
+                safe_floor=0.010,
+                safe_ceil=0.990,
+                min_range=0.020,
+                noise=0.0018,
+                gamma_mode="adaptive",
+                base_gamma=0.60,
+                gamma_bounds=(0.40, 1.00),
+                adapt_str=0.60,
+            ),
+            "small": dict(
+                q_low=1.0,
+                q_high=99.8,
+                safe_floor=0.008,
+                safe_ceil=0.990,
+                min_range=0.030,
+                noise=0.0015,
+                gamma_mode="adaptive",
+                base_gamma=0.70,
+                gamma_bounds=(0.50, 1.10),
+                adapt_str=0.55,
+            ),
+            "mid": dict(
+                q_low=0.5,
+                q_high=99.5,
+                safe_floor=0.005,
+                safe_ceil=0.990,
+                min_range=0.050,
+                noise=0.0010,
+                gamma_mode="adaptive",
+                base_gamma=0.80,
+                gamma_bounds=(0.60, 1.20),
+                adapt_str=0.50,
+            ),
+            "large": dict(
+                q_low=0.2,
+                q_high=99.8,
+                safe_floor=0.003,
+                safe_ceil=0.995,
+                min_range=0.080,
+                noise=0.0008,
+                gamma_mode="adaptive",
+                base_gamma=0.95,
+                gamma_bounds=(0.70, 1.30),
+                adapt_str=0.40,
+            ),
+            "huge": dict(
+                q_low=0.1,
+                q_high=99.9,
+                safe_floor=0.000,
+                safe_ceil=1.000,
+                min_range=0.120,
+                noise=0.0005,
+                gamma_mode="adaptive",
+                base_gamma=1.05,
+                gamma_bounds=(0.80, 1.40),
+                adapt_str=0.30,
+            ),
+        }
+
+        # ---------- 统计域（与你原代码一致） ----------
         if image.ndim == 2:
             stat = image
         else:
@@ -437,113 +582,225 @@ class ImagePreprocessor:
         if downsample and downsample > 1 and stat_src.ndim == 2:
             h, w = stat_src.shape
             stat_src = cv2.resize(
-                stat_src, (max(1, w // downsample), max(1, h // downsample)),
-                interpolation=cv2.INTER_AREA
+                stat_src,
+                (max(1, w // downsample), max(1, h // downsample)),
+                interpolation=cv2.INTER_AREA,
             )
 
-        # —— 统计前中值去噪；可选对整图做一次中值去噪（红外弱信号时有帮助）——
         if median_ksize and median_ksize > 1:
             k = median_ksize if (median_ksize % 2 == 1) else (median_ksize + 1)
             if stat_src.ndim == 2:
                 stat_src = cv2.medianBlur(stat_src, ksize=k)
-                # 若你只想让统计更稳，不想改动原图，可注释下一行：
-                # 对整图也做一次同核的中值去噪（可视需要保留/去掉）
+                # 若仅想稳统计而不动原图，可注释下一行
                 image = cv2.medianBlur(image, ksize=k)
 
-        # —— 稳健动态范围（避免极端像素干扰）——
-        # 用 0.1% 与 99.9% 分位作为 robust min/max
-        rb_lo = float(np.percentile(stat_src, 0.1))
-        rb_hi = float(np.percentile(stat_src, 99.9))
+        # =============== 分两种路径：单帧 vs. 视频稳态 ===============
+        if video_state is None:
+            # -------- 单帧模式：与你原来基本一致（直接 per-frame 分位） --------
+            rb_lo = float(np.percentile(stat_src, 0.1))
+            rb_hi = float(np.percentile(stat_src, 99.9))
+            rb_range = max(rb_hi - rb_lo, eps)
+
+            if rb_range < 256:
+                seg = "tiny"
+            elif rb_range < 512:
+                seg = "small"
+            elif rb_range < 1024:
+                seg = "mid"
+            elif rb_range < 2048:
+                seg = "large"
+            else:
+                seg = "huge"
+
+            P = params_table[seg]
+            lo = float(np.percentile(stat_src, P["q_low"]))
+            hi = float(np.percentile(stat_src, P["q_high"]))
+
+            safe_min = max(lo, max_val * P["safe_floor"])
+            safe_max = min(hi, max_val * P["safe_ceil"])
+            valid_range = max(safe_max - safe_min, max_val * P["min_range"], eps)
+
+            if P["gamma_mode"] == "adaptive":
+                prev = (
+                    stat_src.astype(np.float32) - safe_min + max_val * P["noise"]
+                ) / valid_range
+                prev = np.clip(prev, 0.0, 1.0)
+                avg = float(prev.mean()) if prev.size > 0 else 0.5
+                adj_gamma = P["base_gamma"] * (1.0 + P["adapt_str"] * (0.5 - avg))
+                adj_gamma = float(
+                    np.clip(adj_gamma, P["gamma_bounds"][0], P["gamma_bounds"][1])
+                )
+            else:
+                adj_gamma = P["base_gamma"]
+
+            # 构建 LUT 并应用
+            x = np.arange(max_val + 1, dtype=np.float32)
+            y = (x - safe_min + max_val * P["noise"]) / valid_range
+            np.clip(y, 0.0, 1.0, out=y)
+            y = np.power(y, adj_gamma) * max_val
+            lut = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
+
+            img_min, img_max = image.min(), image.max()
+            if img_max > max_val and print_debug:
+                logger.warning(
+                    f"警告：图像像素值超出范围 [{img_min}, {img_max}]，将裁剪到 [0, {max_val}]"
+                )
+
+            img_clip = np.clip(image, 0, max_val)
+            if img_clip.ndim == 2:
+                out = lut[img_clip]
+            else:
+                out = np.empty_like(img_clip)
+                for c in range(img_clip.shape[2]):
+                    out[..., c] = lut[img_clip[..., c]]
+
+            if print_debug:
+                logger.info(
+                    f"[single] seg={seg} R={rb_range:.1f} lo/hi={lo:.1f}/{hi:.1f} "
+                    f"smin/smax={safe_min:.1f}/{safe_max:.1f} V={valid_range:.1f} gamma={adj_gamma:.3f} "
+                    f"time={(time.time()-t0):.4f}s"
+                )
+            return out
+
+        # ================== 视频稳态路径（防闪烁） ==================
+        # —— 默认稳态配置，可被 config 覆盖 ——
+        C = dict(
+            bins=1024,
+            ds=4,
+            rho_hist=0.25,
+            alpha_param=0.15,
+            beta_lut=0.20,
+            delta_abs=6.0,
+            delta_rel=0.10,
+            hys_up=1.10,
+            hys_dn=0.90,
+            scene_jump_th=0.30,
+        )
+        if config:
+            C.update(config)
+
+        # 初始化 video_state 的键
+        H_ema = video_state.get("hist_ema")
+        prev_lut = video_state.get("prev_lut")
+        prev_params = video_state.get("prev_params")  # (smin, smax, gamma)
+        prev_seg = video_state.get("segment")
+        prev_R = video_state.get("prev_R")
+
+        # 统计直方图用的图：再次轻模糊 + 额外下采样
+        stat_hist = stat_src
+        if C["ds"] and C["ds"] > 1:
+            hh, ww = stat_hist.shape
+            stat_hist = cv2.resize(
+                stat_hist,
+                (max(1, ww // C["ds"]), max(1, hh // C["ds"])),
+                interpolation=cv2.INTER_AREA,
+            )
+        stat_hist = cv2.GaussianBlur(stat_hist, (5, 5), 0)
+
+        H_now = _hist_u16(stat_hist, max_val, bins=C["bins"])
+        dist = _hist_bhat_dist(H_ema, H_now)
+        if H_ema is None:
+            H_ema = H_now.copy()
+        else:
+            H_ema = (1 - C["rho_hist"]) * H_ema + C["rho_hist"] * H_now
+
+        # 用 EMA 直方图取非常鲁棒的 R（0.1~99.9）
+        rb_lo = _pct_from_hist(H_ema, 0.1, max_val, C["bins"])
+        rb_hi = _pct_from_hist(H_ema, 99.9, max_val, C["bins"])
         rb_range = max(rb_hi - rb_lo, eps)
 
-        # —— 动态范围分段（单位：灰度级，绝对门限）——
-        # <256, 256–512, 512–1024, 1024–2048, >2048
-        if rb_range < 256:
-            seg = "tiny"
-        elif rb_range < 512:
-            seg = "small"
-        elif rb_range < 1024:
-            seg = "mid"
-        elif rb_range < 2048:
-            seg = "large"
-        else:
-            seg = "huge"
-
-        # —— 各分段参数表 —— 
-        # 说明：
-        # - q_low/q_high：用于估计安全上下限的分位点（越“收敛”越抗噪）
-        # - safe_floor/safe_ceil：对安全上下限做满量程约束(比例)，避免过度扩展
-        # - min_range：有效范围的最小下限（按满量程比例）。越大 => 拉伸更保守。
-        # - noise：在归一化前加一点点偏置，抑制暗噪点导致的过度增益。
-        # - gamma_mode='adaptive'：对 γ 做轻微自适应，依据统计域的亮度均值调整。
-        #   adj_gamma = base_gamma * (1 + adapt_str*(0.5 - avg))
-        #   avg 为映射到 [0,1] 的预览均值（根据 safe_min/safe_max/valid_range 算）
-        params_table = {
-            "tiny":  dict(q_low=5.0,   q_high=99.8, safe_floor=0.010, safe_ceil=0.990,
-                          min_range=0.020, noise=0.0018, gamma_mode="adaptive",
-                          base_gamma=0.60, gamma_bounds=(0.40, 1.00), adapt_str=0.60),
-            "small": dict(q_low=1.0,   q_high=99.8, safe_floor=0.008, safe_ceil=0.990,
-                          min_range=0.030, noise=0.0015, gamma_mode="adaptive",
-                          base_gamma=0.70, gamma_bounds=(0.50, 1.10), adapt_str=0.55),
-            "mid":   dict(q_low=0.5,   q_high=99.5, safe_floor=0.005, safe_ceil=0.990,
-                          min_range=0.050, noise=0.0010, gamma_mode="adaptive",
-                          base_gamma=0.80, gamma_bounds=(0.60, 1.20), adapt_str=0.50),
-            "large": dict(q_low=0.2,   q_high=99.8, safe_floor=0.003, safe_ceil=0.995,
-                          min_range=0.080, noise=0.0008, gamma_mode="adaptive",
-                          base_gamma=0.95, gamma_bounds=(0.70, 1.30), adapt_str=0.40),
-            "huge":  dict(q_low=0.1,   q_high=99.9, safe_floor=0.000, safe_ceil=1.000,
-                          min_range=0.120, noise=0.0005, gamma_mode="adaptive",
-                          base_gamma=1.05, gamma_bounds=(0.80, 1.40), adapt_str=0.30),
-        }
+        # 分段（带滞回）
+        seg = _decide_segment(rb_range, prev_seg, C["hys_up"], C["hys_dn"])
         P = params_table[seg]
 
-        # —— 分位数安全上下限（在该分段策略下重算）——
-        lo = float(np.percentile(stat_src, P["q_low"]))
-        hi = float(np.percentile(stat_src, P["q_high"]))
+        # 用 EMA 直方图取该分段下的 lo/hi
+        lo = _pct_from_hist(H_ema, P["q_low"], max_val, C["bins"])
+        hi = _pct_from_hist(H_ema, P["q_high"], max_val, C["bins"])
 
-        safe_min = max(lo, max_val * P["safe_floor"])
-        safe_max = min(hi, max_val * P["safe_ceil"])
-        valid_range = max(safe_max - safe_min, max_val * P["min_range"], eps)
+        smin_raw = max(lo, max_val * P["safe_floor"])
+        smax_raw = min(hi, max_val * P["safe_ceil"])
+        V_raw = max(smax_raw - smin_raw, max_val * P["min_range"], eps)
 
-        # —— 自适应 γ —— 
+        # 自适应 γ（先算“原始目标γ”）
         if P["gamma_mode"] == "adaptive":
-            prev = (stat_src.astype(np.float32) - safe_min + max_val * P["noise"]) / valid_range
+            prev = (
+                stat_src.astype(np.float32) - smin_raw + max_val * P["noise"]
+            ) / V_raw
             prev = np.clip(prev, 0.0, 1.0)
             avg = float(prev.mean()) if prev.size > 0 else 0.5
-            adj_gamma = P["base_gamma"] * (1.0 + P["adapt_str"] * (0.5 - avg))
-            adj_gamma = float(np.clip(adj_gamma, P["gamma_bounds"][0], P["gamma_bounds"][1]))
+            gamma_raw = P["base_gamma"] * (1.0 + P["adapt_str"] * (0.5 - avg))
+            gamma_raw = float(
+                np.clip(gamma_raw, P["gamma_bounds"][0], P["gamma_bounds"][1])
+            )
         else:
-            adj_gamma = P["base_gamma"]
+            gamma_raw = P["base_gamma"]
 
-        if print_debug:
-            print(f"[adaptive-stretch] seg={seg}  rb_range={rb_range:.1f}  "
-                  f"lo/hi={lo:.1f}/{hi:.1f}  safe_min/max={safe_min:.1f}/{safe_max:.1f}  "
-                  f"valid_range={valid_range:.1f}  gamma={adj_gamma:.3f}")
+        # 场景突变 → 暂时加快收敛
+        alpha_param = C["alpha_param"]
+        beta_lut = C["beta_lut"]
+        if dist > C["scene_jump_th"]:
+            alpha_param = min(0.8, alpha_param * (1 + 2.0 * dist))
+            beta_lut = min(0.8, beta_lut * (1 + 2.0 * dist))
 
-        # —— 构建 LUT（uint16→uint16），然后套到所有通道 —— 
+        # 参数限幅 + EMA
+        if prev_params is None:
+            smin = smin_raw
+            smax = smax_raw
+            gamma = gamma_raw
+        else:
+            p_smin, p_smax, p_gamma = prev_params
+            smin = _limit_step(p_smin, smin_raw, C["delta_abs"], C["delta_rel"])
+            smax = _limit_step(p_smax, smax_raw, C["delta_abs"], C["delta_rel"])
+            gamma = _limit_step(p_gamma, gamma_raw, C["delta_abs"], C["delta_rel"])
+            smin = _ema(p_smin, smin, alpha_param)
+            smax = _ema(p_smax, smax, alpha_param)
+            gamma = _ema(p_gamma, gamma, alpha_param)
+
+        # 构建目标 LUT 并与前一帧 LUT 渐变
         x = np.arange(max_val + 1, dtype=np.float32)
-        y = (x - safe_min + max_val * P["noise"]) / valid_range
+        V = max(smax - smin, eps)
+        y = (x - smin + max_val * P["noise"]) / V
         np.clip(y, 0.0, 1.0, out=y)
-        y = np.power(y, adj_gamma) * max_val
-        lut = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
+        y = np.power(y, gamma) * max_val
+        lut_target = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
 
-        # —— 应用 LUT —— 
-        image_min, image_max = image.min(), image.max()
-        if image_max > max_val and print_debug:
-            print(f"警告：图像像素值超出范围 [{image_min}, {image_max}]，将裁剪到 [0, {max_val}]")
-
-        image_clipped = np.clip(image, 0, max_val)
-        if image.ndim == 2:
-            out = lut[image_clipped]
+        if prev_lut is None:
+            lut = lut_target
         else:
-            out = np.empty_like(image)
-            # 对每个通道套同一 LUT，保持风格一致
-            for c in range(image.shape[2]):
-                out[..., c] = lut[image_clipped[..., c]]
+            lut = (
+                (1 - beta_lut) * prev_lut.astype(np.float32)
+                + beta_lut * lut_target.astype(np.float32)
+            ).astype(np.uint16)
+
+        # 应用 LUT
+        img_min, img_max = image.min(), image.max()
+        if img_max > max_val and print_debug:
+            logger.warning(
+                f"警告：图像像素值超出范围 [{img_min}, {img_max}]，将裁剪到 [0, {max_val}]"
+            )
+
+        img_clip = np.clip(image, 0, max_val)
+        if img_clip.ndim == 2:
+            out = lut[img_clip]
+        else:
+            out = np.empty_like(img_clip)
+            for c in range(img_clip.shape[2]):
+                out[..., c] = lut[img_clip[..., c]]
+
+        # 更新 video_state（原地修改）
+        video_state["hist_ema"] = H_ema
+        video_state["prev_lut"] = lut
+        video_state["prev_params"] = (smin, smax, gamma)
+        video_state["segment"] = seg
+        video_state["prev_R"] = rb_range
 
         if print_debug:
-            elapsed = time.time() - start_time
-            print(f"stretch_u16_adaptive 处理耗时: {elapsed:.4f} 秒")
+            logger.info(
+                f"[video] seg={seg} R={rb_range:.1f} lo/hi={lo:.1f}/{hi:.1f} "
+                f"smin/smax={smin:.1f}/{smax:.1f} V={V:.1f} gamma={gamma:.3f} "
+                f"hist_dist={dist:.3f} alpha={alpha_param:.2f} beta_lut={beta_lut:.2f} "
+                f"time={(time.time()-t0):.4f}s"
+            )
 
         return out
     
@@ -644,6 +901,12 @@ class ImagePreprocessor:
         y = (x - safe_min + max_val * noise) / valid_range
         np.clip(y, 0.0, 1.0, out=y)
         y = np.power(y, adj_gamma) * max_val
+
+        midtone_boost = 0.08  # 建议 0.05~0.12，小幅提亮
+        y_norm = y / max_val
+        y_norm = y_norm + midtone_boost * y_norm * (1.0 - y_norm)  # 只抬中灰
+        y = y_norm * max_val
+
         lut = np.clip(y, 0.0, float(max_val)).astype(np.uint16)
 
         # 使用numpy索引操作替代cv2.LUT（因为cv2.LUT不支持16位）
@@ -796,31 +1059,79 @@ class ImagePreprocessor:
         return result
 
     def apply_sharping(self, image):
+        start_time = time.time()
+        blurred = cv2.GaussianBlur(image, (5, 5), 1.5)
+        result = cv2.addWeighted(image, 2, blurred, -1.0, 0)
+        elapsed_time = time.time() - start_time
+        print(f"apply_sharping 处理耗时: {elapsed_time:.4f} 秒")
+        return result
+    
+    def apply_sharping_alpah(self, image):
 
         start_time = time.time()
 
-        # —— 配置：可按需微调（已给出较稳的默认值）——
-        amount = 1.5          # 锐化强度（1.2~1.8常用）
-        radius_small = 1      # 小尺度半径（kernel=3）
-        radius_large = 3      # 大尺度半径（kernel=7）
-        thr_rel = 0.003       # 相对阈值(满量程比例)，抑制噪声（红外可 0.003~0.006）
-        multiscale = True     # 是否进行多尺度叠加（更锐利仍然很快）
-        work_in_y = True      # 彩色图只在Y通道锐化，避免色偏
+        # ========= 加速档位（按需切换） =========
+        FAST_MODE   = True   # True: 单尺度 USM，取消形态学“过冲保护”，大幅提速
+        ULTRA_FAST  = False  # True: 3x3 拉普拉斯锐化（最快），适度有锐化边缘纹理
 
-        # —— dtype & 满量程 —— 
+        # —— 配置（FAST/正常模式通用）——
+        amount = 1.5          # 锐化强度
+        radius_small = 1      # USM 半径（kernel=3）
+        radius_large = 3      # 多尺度时的大半径（kernel=7）
+        thr_rel = 0.003       # 相对阈值(满量程比例)，抑制噪声
+        multiscale = (not FAST_MODE)  # FAST_MODE 关闭多尺度以提速
+        work_in_y = True      # 彩色时仅在Y通道锐化
+
         orig_dtype = image.dtype
         if np.issubdtype(orig_dtype, np.integer):
             max_val = np.iinfo(orig_dtype).max
         else:
             vmax = float(np.max(image)) if image.size else 1.0
             max_val = vmax if vmax > 1.0 else 1.0
-
         thr_abs = float(thr_rel) * float(max_val)
 
+        # 预创建 3x3 形态学核（仅在需要时使用）
+        kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+        # ========= ULTRA_FAST：拉普拉斯（最快）=========
+        if ULTRA_FAST:
+            # 彩色则转Y通道，灰度直接处理
+            if image.ndim == 3 and work_in_y:
+                yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+                y, u, v = cv2.split(yuv)
+                y32 = y.astype(np.float32)
+                lap = cv2.Laplacian(y32, ddepth=cv2.CV_32F, ksize=3, borderType=cv2.BORDER_REPLICATE)
+                # 阈值抑噪
+                if thr_abs > 0:
+                    np.putmask(lap, np.abs(lap) < thr_abs, 0.0)
+                out = y32 + amount * lap
+                out = np.clip(out, 0, max_val).astype(orig_dtype)
+                result = cv2.cvtColor(cv2.merge((out, u, v)), cv2.COLOR_YUV2BGR)
+            else:
+                ch = image if image.ndim == 2 else cv2.split(image)
+                def _lap_fast(c):
+                    c32 = c.astype(np.float32)
+                    lap = cv2.Laplacian(c32, ddepth=cv2.CV_32F, ksize=3, borderType=cv2.BORDER_REPLICATE)
+                    if thr_abs > 0:
+                        np.putmask(lap, np.abs(lap) < thr_abs, 0.0)
+                    o = c32 + amount * lap
+                    return np.clip(o, 0, max_val).astype(orig_dtype)
+                if image.ndim == 2:
+                    result = _lap_fast(ch)
+                else:
+                    b, g, r = ch
+                    result = cv2.merge((_lap_fast(b), _lap_fast(g), _lap_fast(r)))
+            print(f"apply_sharping 处理耗时: {time.time() - start_time:.4f} 秒")
+            return result
+
+        # ========= FAST / 正常：USM =========
         def _box_blur(src_f32, r: int):
             k = 2 * r + 1
             return cv2.boxFilter(src_f32, ddepth=-1, ksize=(k, k),
                                 normalize=True, borderType=cv2.BORDER_REPLICATE)
+
+        # 是否启用过冲保护（FAST_MODE 下关闭以省去 erode/dilate）
+        OVERDRIVE_PROTECT = (not FAST_MODE)
 
         def _usm_once(src_f32, r: int, amt: float, thr_abs_: float):
             blur = _box_blur(src_f32, r)
@@ -828,11 +1139,10 @@ class ImagePreprocessor:
             if thr_abs_ > 0:
                 np.putmask(mask, np.abs(mask) < thr_abs_, 0.0)  # 硬阈值，快
             dst = src_f32 + amt * mask
-            # 过冲保护：夹到3x3局部最小/最大，减少光晕
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            lo = cv2.erode(src_f32, kernel)
-            hi = cv2.dilate(src_f32, kernel)
-            dst = np.minimum(np.maximum(dst, lo), hi)
+            if OVERDRIVE_PROTECT:
+                lo = cv2.erode(src_f32, kernel3)
+                hi = cv2.dilate(src_f32, kernel3)
+                dst = np.minimum(np.maximum(dst, lo), hi)
             return dst
 
         def _sharpen_single_channel(ch):
@@ -843,10 +1153,9 @@ class ImagePreprocessor:
                 out = 0.7 * s1 + 0.3 * s2
             else:
                 out = _usm_once(ch_f, radius_small, amount, thr_abs)
-            out = np.clip(out, 0, max_val)
-            return out.astype(orig_dtype)
+            return np.clip(out, 0, max_val).astype(orig_dtype)
 
-        if image.ndim == 2:  # 灰度（如红外 uint16）
+        if image.ndim == 2:  # 灰度
             result = _sharpen_single_channel(image)
         else:                # 彩色（BGR）
             if work_in_y:
@@ -856,13 +1165,11 @@ class ImagePreprocessor:
                 result = cv2.cvtColor(cv2.merge((y_sharp, u, v)), cv2.COLOR_YUV2BGR)
             else:
                 b, g, r = cv2.split(image)
-                b = _sharpen_single_channel(b)
-                g = _sharpen_single_channel(g)
-                r = _sharpen_single_channel(r)
-                result = cv2.merge((b, g, r))
+                result = cv2.merge((_sharpen_single_channel(b),
+                                    _sharpen_single_channel(g),
+                                    _sharpen_single_channel(r)))
 
-        elapsed_time = time.time() - start_time
-        print(f"apply_sharping 处理耗时: {elapsed_time:.4f} 秒")
+        print(f"apply_sharping 处理耗时: {time.time() - start_time:.4f} 秒")
         return result
 
 

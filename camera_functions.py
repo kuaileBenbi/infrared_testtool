@@ -89,6 +89,7 @@ class CameraFunctions:
         self.denoise_enabled = False
         self.stretch_enabled = False
         self.adaptive_stretch_enabled = False
+        self.stretch_state = {}
         self.defog_enabled = False
 
         # 变量初始化
@@ -587,7 +588,8 @@ class CameraFunctions:
                 max_val=bit_max,
                 downsample=downsample,
                 median_ksize=median_ksize,
-                print_debug=True
+                print_debug=True,
+                video_state=self.stretch_state
             )
         
         if self.denoise_enabled:
@@ -1064,6 +1066,8 @@ class CameraFunctions:
         """应用自适应拉伸处理"""
         self.adaptive_stretch_enabled = not self.adaptive_stretch_enabled
         state = "enabled" if self.adaptive_stretch_enabled else "disabled"
+
+        self.stretch_state = {}
         print("Info", f"Adaptive stretch {state}")
 
         # 如果是离线图片模式，重新处理图片
