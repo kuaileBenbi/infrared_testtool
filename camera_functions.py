@@ -92,6 +92,8 @@ class CameraFunctions:
         self.adaptive_stretch_enabled = False
         self.stretch_state = {}
         self.defog_enabled = False
+        self.roi_stretch_enabled = False
+        self.roi_stretch_rect = None  # (x1, x2, y1, y2)
 
         # 变量初始化
         self.blind_mask = None  # 盲元表存储
@@ -569,6 +571,29 @@ class CameraFunctions:
                 level=level,
                 median_ksize=median_ksize
             )
+
+        # 区域拉伸：仅对指定ROI做灰度拉伸，其余区域置0
+        if self.roi_stretch_enabled and self.roi_stretch_rect is not None:
+            x1, x2, y1, y2 = self.roi_stretch_rect
+            h, w = processed_frame.shape[:2]
+            x1 = max(0, min(int(x1), w - 1))
+            x2 = max(0, min(int(x2), w))
+            y1 = max(0, min(int(y1), h - 1))
+            y2 = max(0, min(int(y2), h))
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+            roi = processed_frame[y1:y2, x1:x2]
+            if roi.size > 0:
+                bit_max = getattr(self, 'bit_max', 4095)
+                stretched_roi = self.precessor.process(
+                    img=roi,
+                    bit_max=bit_max,
+                )
+                out = np.zeros_like(processed_frame)
+                out[y1:y2, x1:x2] = stretched_roi
+                processed_frame = out
 
         if self.adaptive_stretch_enabled:
             bit_max = getattr(self, 'bit_max', 4095)
@@ -1085,6 +1110,16 @@ class CameraFunctions:
         print("Info", f"Image defog {state}")
 
         # 如果是离线图片模式，重新处理图片
+        if self.offline_image_mode and self.offline_image is not None:
+            self._trigger_offline_reprocess()
+
+    def toggle_roi_stretch(self, rect):
+        """启停区域拉伸，rect: (x1, x2, y1, y2) 像素坐标"""
+        if rect is not None:
+            self.roi_stretch_rect = rect
+        self.roi_stretch_enabled = not self.roi_stretch_enabled
+        state = "enabled" if self.roi_stretch_enabled else "disabled"
+        print("Info", f"ROI stretch {state}, rect={self.roi_stretch_rect}")
         if self.offline_image_mode and self.offline_image is not None:
             self._trigger_offline_reprocess()
 

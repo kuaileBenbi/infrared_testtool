@@ -201,6 +201,7 @@ class CameraApp:
         # 图像拉伸功能
         self.ui.apply_stretch_btn.config(command=self.camera_func.image_stretch)
         self.ui.adaptive_stretch_btn.config(command=self.camera_func.adaptive_stretch)
+        self.ui.roi_stretch_btn.config(command=self.on_roi_stretch_click)
 
         # 数据源控制
         self.ui.start_stop_btn.config(command=self.on_start_stop_click)
@@ -237,6 +238,20 @@ class CameraApp:
 
         self.camera_func.bp_npz_path = filepath
         print(f"成功加载坏点文件: {filepath}")
+
+    def on_roi_stretch_click(self):
+        """解析输入并启停区域拉伸"""
+        try:
+            text = self.ui.roi_stretch_entry.get().strip()
+            # 期望格式: x1:x2,y1:y2
+            xy = text.split(',')
+            x_part = xy[0].split(':')
+            y_part = xy[1].split(':')
+            x1, x2 = int(x_part[0]), int(x_part[1])
+            y1, y2 = int(y_part[0]), int(y_part[1])
+            self.camera_func.toggle_roi_stretch((x1, x2, y1, y2))
+        except Exception as e:
+            print(f"区域拉伸参数错误: '{text}'，示例: 0:256,0:256. 错误: {e}")
 
     def load_local_image(self):
         """加载本地图像"""

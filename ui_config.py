@@ -691,6 +691,17 @@ class UIConfig:
         self.adaptive_stretch_btn = tk.Button(stretch_frame, text="自适应拉伸", font=self.button_font)
         self.adaptive_stretch_btn.pack(fill=tk.X, pady=2)
 
+        # 区域拉伸参数与按钮
+        roi_stretch_frame = tk.Frame(stretch_frame)
+        roi_stretch_frame.pack(fill=tk.X, pady=2)
+        tk.Label(roi_stretch_frame, text="区域(x1:x2,y1:y2):", font=self.label_font).pack(side=tk.LEFT)
+        self.roi_stretch_entry = tk.Entry(roi_stretch_frame, width=16, font=self.text_font)
+        self.roi_stretch_entry.pack(side=tk.LEFT, padx=5)
+        self.roi_stretch_entry.insert(0, "0:256,0:256")
+
+        self.roi_stretch_btn = tk.Button(stretch_frame, text="区域拉伸(启停)", font=self.button_font)
+        self.roi_stretch_btn.pack(fill=tk.X, pady=2)
+
         # 图像增强
         enhance_frame = tk.LabelFrame(
             self.basic_processing_col, text="图像增强", padx=5, pady=5
