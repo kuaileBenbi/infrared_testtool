@@ -181,7 +181,30 @@ class CameraFunctions:
             self.running = True
             self._start_v4l2_stream()
             self.init_camera()
+            if self.wave == "lwir":
+                self.v4l2cmd()
             print("摄像头模式已启动")
+    
+    def v4l2cmd(self):
+        """发送积分时间设置指令"""
+        time.sleep(1) # 等待1秒，让相机初始化
+
+        cmd = f"v4l2-ctl -d /dev/video{self.device_num} --get-ctrl=exposure"
+        result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            exposure_value = result.stdout.strip()  # 获取并清理返回值
+            print(f"积分时间: {exposure_value}")
+            if exposure_value == "3500":
+                time.sleep(0.05)
+                print(f"设置为小积分时间：{1000}")
+                cmd = f"v4l2-ctl -d /dev/video{self.device_num} --set-ctrl=exposure=1000"
+                result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    print(f"设置积分时间成功: {result.stdout}")
+                else:
+                    print(f"设置积分时间失败: {result.stderr}")
+        else:
+            print(f"获取积分时间失败: {result.stderr}")
 
     def _start_v4l2_stream(self):
         """启动v4l2流"""
