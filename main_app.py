@@ -150,6 +150,9 @@ class CameraApp:
         # 启动帧率更新
         self.ui.capture_fps_label.after(1000, self._update_fps)
 
+        # 若曾用于时序噪声/FPN，现移除
+        self._recent_frames = None
+
     def bind_events(self):
         """绑定所有按钮事件"""
         # 存储功能
@@ -197,6 +200,8 @@ class CameraApp:
         self.ui.calculate_clarity_btn.config(command=self.calculate_image_clarity)
         self.ui.calculate_brightness_btn.config(command=self.calculate_image_brightness)
         self.ui.clear_quality_btn.config(command=self.clear_quality_metrics)
+        if hasattr(self.ui, 'calculate_quality_btn'):
+            self.ui.calculate_quality_btn.config(command=self.calculate_image_quality_metrics)
         
         # 图像拉伸功能
         self.ui.apply_stretch_btn.config(command=self.camera_func.image_stretch)
@@ -864,66 +869,142 @@ class CameraApp:
         
         print("直方图窗口已打开")
 
-    def _draw_gray_histogram_standalone(self, ax, image):
-        """绘制灰度直方图 - 独立窗口版本"""
-        # 确保图像是灰度图
-        if len(image.shape) == 3:
-            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    def _draw_gray_histogram_standalone(self, ax, image,
+                                    log_y=True,
+                                    clip_tail_for_view=0.005,   # 仅用于显示的两端裁剪比例（0~0.02较常用）
+                                    show_kde=False):            # 灰度为离散值时KDE意义有限，默认False
+        """
+        绘制更符合人眼观察的灰度直方图（独立窗口版）
+
+        Args:
+            ax: matplotlib Axes
+            image: np.ndarray, 灰度或BGR
+            log_y (bool): y轴使用对数刻度，更易看尾部细节
+            clip_tail_for_view (float): 仅用于可视化的两端裁剪比例，如0.005表示裁掉上下各0.5%像素的灰度范围
+            show_kde (bool): 是否叠加KDE曲线（高分辨率连续灰度时可开）
+        """
+        # ---- 预处理：转灰度、去NaN/Inf、转为float计算 ----
+        if image is None:
+            ax.text(0.5, 0.5, "No image", ha='center', va='center', transform=ax.transAxes)
+            return
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if (image.ndim == 3) else image
+        gray = np.asarray(gray)
+        gray = gray[np.isfinite(gray)]
+        if gray.size == 0:
+            ax.text(0.5, 0.5, "Empty image", ha='center', va='center', transform=ax.transAxes)
+            return
+
+        # 尽量保持原始灰度单位（支持10-16bit）
+        gray_min, gray_max = float(np.min(gray)), float(np.max(gray))
+        dynamic_range = gray_max - gray_min if gray_max > gray_min else 1.0
+
+        # ---- 统计量 ----
+        mean_val = float(np.mean(gray))
+        std_val  = float(np.std(gray))
+        median_val = float(np.median(gray))
+        p1, p5, p95, p99 = np.percentile(gray, [1, 5, 95, 99])
+        # 众数（用直方图近似）
+        # 先用较细分箱估一个峰
+        _bins_for_mode = min(1024, max(32, int(np.sqrt(gray.size))))
+        hist_tmp, edges_tmp = np.histogram(gray, bins=_bins_for_mode, range=(gray_min, gray_max))
+        mode_idx = int(np.argmax(hist_tmp))
+        mode_val = 0.5 * (edges_tmp[mode_idx] + edges_tmp[mode_idx + 1])
+
+        # 信息熵（基于归一化直方图）
+        p_hist = hist_tmp / np.sum(hist_tmp) if np.sum(hist_tmp) > 0 else hist_tmp
+        entropy = float(-np.sum(p_hist[p_hist > 0] * np.log2(p_hist[p_hist > 0])))
+
+        # ---- 仅用于显示的范围裁剪（防止极端值把横轴拉飞）----
+        if 0 < clip_tail_for_view < 0.2:
+            lo, hi = np.percentile(gray, [clip_tail_for_view * 100, 100 - clip_tail_for_view * 100])
+            view_min, view_max = float(lo), float(hi)
+            if view_max <= view_min:
+                view_min, view_max = gray_min, gray_max
         else:
-            gray_image = image
-        
-        # 计算直方图
-        hist = cv2.calcHist([gray_image], [0], None, [256], [0, 256])
-        hist = hist.flatten()
-        
-        # 绘制柱状直方图
-        ax.bar(range(256), hist, color='#A23B72', alpha=0.7, width=1.0)
-        
-        ax.set_xlabel('灰度值', fontsize=12, fontweight='bold')
-        ax.set_ylabel('像素数量', fontsize=12, fontweight='bold')
-        ax.set_title('灰度直方图', fontsize=14, fontweight='bold', pad=20)
-        ax.grid(True, alpha=0.3, linestyle='--')
-        ax.set_xlim(0, 255)
-        ax.set_ylim(0, hist.max() * 1.05)  # 留一点顶部空间
-        
-        # 计算统计信息
-        mean_val = np.mean(gray_image)
-        std_val = np.std(gray_image)
-        min_val = np.min(gray_image)
-        max_val = np.max(gray_image)
-        median_val = np.median(gray_image)
-        peak_idx = np.argmax(hist)
-        peak_value = hist[peak_idx]
-        dynamic_range = max_val - min_val
-        
-        # 在直方图上标记统计信息
-        ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, alpha=0.8, label=f'均值: {mean_val:.1f}')
-        ax.axvline(median_val, color='green', linestyle='--', linewidth=2, alpha=0.8, label=f'中位数: {median_val:.1f}')
-        ax.axvline(peak_idx, color='orange', linestyle='--', linewidth=2, alpha=0.8, label=f'峰值: {peak_idx}')
-        ax.legend(loc='upper right', fontsize=10)
-        
-        # 添加统计信息
-        stats_text = f'''图像统计信息:
-        
-图像尺寸: {gray_image.shape[1]} × {gray_image.shape[0]} 像素
-总像素数: {gray_image.size:,}
+            view_min, view_max = gray_min, gray_max
 
-灰度统计:
-• 最小值: {min_val}
-• 最大值: {max_val}
-• 均值: {mean_val:.2f}
-• 中位数: {median_val:.2f}
-• 标准差: {std_val:.2f}
-• 动态范围: {dynamic_range}
+        # ---- Freedman–Diaconis 自适应分箱（上限256更易读）----
+        q25, q75 = np.percentile(gray, [25, 75])
+        iqr = max(q75 - q25, 1e-9)
+        bin_width = 2 * iqr * (gray.size ** (-1/3))
+        if bin_width <= 0 or not np.isfinite(bin_width):
+            # 退化情况：用sqrt(N)策略
+            num_bins = int(np.sqrt(gray.size))
+        else:
+            num_bins = int(np.clip(np.ceil((view_max - view_min) / bin_width), 32, 256))
 
-直方图信息:
-• 峰值位置: {peak_idx}
-• 峰值像素数: {peak_value:,.0f}
-• 非零灰度级: {np.count_nonzero(hist)}'''
-        
-        ax.text(1.02, 0.98, stats_text, transform=ax.transAxes, 
-                verticalalignment='top', fontsize=9, 
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.8))
+        hist, edges = np.histogram(gray, bins=num_bins, range=(view_min, view_max))
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+        # ---- 绘图 ----
+        ax.clear()
+
+        # 条形图（密度而非绝对计数，更符合比例感；高度再乘以像素总数可换回计数）
+        density = hist / (hist.sum() + 1e-12)
+        ax.bar(centers, density, align='center', width=(edges[1]-edges[0]), alpha=0.75,
+            edgecolor='none')
+
+        # y轴设置
+        ax.set_ylabel('Density' + (' (log)' if log_y else ''), fontsize=12, fontweight='bold')
+        if log_y:
+            ax.set_yscale('log')
+
+        # x轴：使用原始灰度单位
+        ax.set_xlabel('Gray level (raw units)', fontsize=12, fontweight='bold')
+        ax.set_xlim(view_min, view_max)
+
+        # 叠加 CDF（右侧y轴，百分比）
+        cdf = np.cumsum(hist).astype(np.float64)
+        cdf /= (cdf[-1] + 1e-12)
+        ax2 = ax.twinx()
+        ax2.plot(centers, cdf * 100.0, linewidth=2, alpha=0.9)
+        ax2.set_ylabel('Cumulative %', fontsize=12, fontweight='bold')
+        ax2.set_ylim(0, 100)
+
+        # （可选）KDE，仅在灰度近似连续时有意义
+        if show_kde and gray.size >= 5000:
+            try:
+                from scipy.stats import gaussian_kde
+                kde = gaussian_kde(gray.astype(np.float64))
+                xs = np.linspace(view_min, view_max, 512)
+                ax.plot(xs, kde(xs), linewidth=1.5, alpha=0.8)
+            except Exception:
+                pass
+
+        # 垂线标记：1/50/99百分位、均值、中位数、众数
+        def _vline(x, color, label):
+            ax.axvline(x, color=color, linestyle='--', linewidth=1.8, alpha=0.9)
+            ax.text(x, ax.get_ylim()[1], f' {label}', color=color, fontsize=9,
+                    va='bottom', ha='left', rotation=90, alpha=0.9)
+
+        _vline(p1,   '#888888', 'P1')
+        _vline(median_val, '#2e7d32', 'P50')
+        _vline(p99,  '#888888', 'P99')
+        _vline(mean_val,   '#d32f2f', 'Mean')
+        _vline(mode_val,   '#ef6c00', 'Mode')
+
+        # 网格与标题
+        ax.grid(True, alpha=0.25, linestyle='--')
+        ax.set_title('Gray Histogram', fontsize=14, fontweight='bold', pad=16)
+
+        # 统计侧栏（紧凑）
+        nonzero_ratio = float(np.count_nonzero(gray)) / float(gray.size)
+        stats_text = (
+            f"Size: {int(image.shape[1])}×{int(image.shape[0])}\n"
+            f"Pixels: {gray.size:,}\n"
+            f"Min/Max: {gray_min:.1f}/{gray_max:.1f}\n"
+            f"Mean/Std: {mean_val:.2f}/{std_val:.2f}\n"
+            f"P1/P50/P99: {p1:.1f}/{median_val:.1f}/{p99:.1f}\n"
+            f"Mode≈ {mode_val:.1f}\n"
+            f"Entropy: {entropy:.2f} bits\n"
+            f"Non-zero: {nonzero_ratio*100:.1f}%\n"
+            f"Bins: {num_bins} (view {view_min:.1f}–{view_max:.1f})"
+        )
+        ax.text(1.02, 0.98, stats_text, transform=ax.transAxes,
+                va='top', fontsize=9,
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='whitesmoke', alpha=0.9))
+
 
     def _draw_color_histogram_standalone(self, ax, image):
         """绘制彩色直方图 - 独立窗口版本"""
@@ -1060,12 +1141,63 @@ class CameraApp:
             import traceback
             traceback.print_exc()
 
+    def _get_gray_current(self):
+        image = self.camera_func.current_frame
+        if image is None:
+            return None
+        if image.ndim == 3:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return image
+
+    # 已移除时序帧缓存逻辑
+
+    def calculate_image_quality_metrics(self):
+        """计算并显示五个图像质量指标"""
+        from preprocessor import ImagePreprocessor as IP
+        gray = self._get_gray_current()
+        if gray is None:
+            print("没有可用的图像数据")
+            return
+        try:
+            # 转为float便于频域计算
+            g = gray.astype(np.float64)
+
+            half_power = IP.radial_power_half_freq(g)
+            stripe = IP.stripe_index(g)
+            halo = IP.halo_ratio(g)
+            lowfreq = IP.lowfreq_rms_ratio(g)
+
+            # 更新UI显示（滚动文本）
+            if hasattr(self.ui, 'quality_metrics_text'):
+                lines = [
+                    f"频域清晰度(HPF): {half_power:.4f} cyc/px",
+                    f"条纹指数: {stripe:.3f}",
+                    f"光晕能量比: {halo:.3f}",
+                    f"低频起伏比: {lowfreq:.3f}",
+                ]
+                text = "\n".join(lines)
+                self.ui.quality_metrics_text.config(state="normal")
+                self.ui.quality_metrics_text.delete(1.0, tk.END)
+                self.ui.quality_metrics_text.insert(1.0, text)
+                self.ui.quality_metrics_text.config(state="disabled")
+
+            print("图像质量指标计算完成")
+        except Exception as e:
+            print(f"计算图像质量指标时出错: {e}")
+            import traceback
+            traceback.print_exc()
+
     def clear_quality_metrics(self):
         """清除图像质量评价显示"""
         try:
             # 清除清晰度和亮度显示
             self.ui.image_clarity_label.config(text="")
             self.ui.image_brightness_label.config(text="")
+            # 清空质量文本面板
+            if hasattr(self.ui, 'quality_metrics_text'):
+                self.ui.quality_metrics_text.config(state="normal")
+                self.ui.quality_metrics_text.delete(1.0, tk.END)
+                self.ui.quality_metrics_text.config(state="disabled")
             
             print("图像质量评价显示已清除")
             

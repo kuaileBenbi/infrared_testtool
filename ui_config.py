@@ -569,6 +569,29 @@ class UIConfig:
         self.save_stop_btn = tk.Button(storage_frame, text="连续保存(停止)图像", font=self.button_font)
         self.save_stop_btn.pack(fill=tk.X, pady=2)
 
+        # 图像质量评价
+        quality_frame = tk.LabelFrame(
+            self.control_col, text="图像质量评价", padx=5, pady=5
+        )
+        quality_frame.pack(fill=tk.X, pady=5)
+
+        self.show_histogram_btn = tk.Button(quality_frame, text="显示直方图", font=self.button_font)
+        self.show_histogram_btn.pack(fill=tk.X, pady=2)
+
+        self.calculate_clarity_btn = tk.Button(quality_frame, text="计算清晰度", font=self.button_font)
+        self.calculate_clarity_btn.pack(fill=tk.X, pady=2)
+
+        self.calculate_brightness_btn = tk.Button(quality_frame, text="计算亮度", font=self.button_font)
+        self.calculate_brightness_btn.pack(fill=tk.X, pady=2)
+
+        # 新增：计算综合指标按钮
+        self.calculate_quality_btn = tk.Button(quality_frame, text="计算图像质量指标", font=self.button_font)
+        self.calculate_quality_btn.pack(fill=tk.X, pady=2)
+
+        self.clear_quality_btn = tk.Button(quality_frame, text="清除评价", font=self.button_font)
+        self.clear_quality_btn.pack(fill=tk.X, pady=2)
+
+
     def create_correction_frame(self):
         """创建校正/盲元控制框架"""
         correction_frame = tk.LabelFrame(
@@ -623,35 +646,17 @@ class UIConfig:
         self.show_original_btn = tk.Button(basic_frame, text="显示原图", font=self.button_font)
         self.show_original_btn.pack(fill=tk.X, pady=2)
 
-        self.img_imadjust_btn = tk.Button(basic_frame, text="灰度拉伸", font=self.button_font)
-        self.img_imadjust_btn.pack(fill=tk.X, pady=2)
-
         self.toggle_crosshair_btn = tk.Button(basic_frame, text="开关十字星", font=self.button_font)
         self.toggle_crosshair_btn.pack(fill=tk.X, pady=2)
-        
-        self.show_histogram_btn = tk.Button(basic_frame, text="显示直方图", font=self.button_font)
-        self.show_histogram_btn.pack(fill=tk.X, pady=2)
-
-        # 图像质量评价
-        quality_frame = tk.LabelFrame(
-            self.basic_processing_col, text="图像质量评价", padx=5, pady=5
-        )
-        quality_frame.pack(fill=tk.X, pady=5)
-
-        self.calculate_clarity_btn = tk.Button(quality_frame, text="计算清晰度", font=self.button_font)
-        self.calculate_clarity_btn.pack(fill=tk.X, pady=2)
-
-        self.calculate_brightness_btn = tk.Button(quality_frame, text="计算亮度", font=self.button_font)
-        self.calculate_brightness_btn.pack(fill=tk.X, pady=2)
-
-        self.clear_quality_btn = tk.Button(quality_frame, text="清除评价", font=self.button_font)
-        self.clear_quality_btn.pack(fill=tk.X, pady=2)
 
         # 图像拉伸功能
         stretch_frame = tk.LabelFrame(
             self.basic_processing_col, text="图像拉伸", padx=5, pady=5
         )
         stretch_frame.pack(fill=tk.X, pady=5)
+
+        self.img_imadjust_btn = tk.Button(stretch_frame, text="普通拉伸", font=self.button_font)
+        self.img_imadjust_btn.pack(fill=tk.X, pady=2)
 
         # 拉伸级别选择
         level_frame = tk.Frame(stretch_frame)
@@ -684,7 +689,7 @@ class UIConfig:
         median_combo.pack(side=tk.LEFT, padx=5)
 
         # 应用拉伸按钮
-        self.apply_stretch_btn = tk.Button(stretch_frame, text="应用拉伸", font=self.button_font)
+        self.apply_stretch_btn = tk.Button(stretch_frame, text="应用级别拉伸", font=self.button_font)
         self.apply_stretch_btn.pack(fill=tk.X, pady=2)
 
         # 自适应拉伸按钮
@@ -837,3 +842,17 @@ class UIConfig:
             status_frame, text="", font=self.status_font, fg="green", anchor="w"
         )
         self.image_brightness_label.pack(fill=tk.X, pady=2)
+
+        # 图像质量指标（滚动面板，适配小屏）
+        quality_text_frame = tk.Frame(status_frame)
+        quality_text_frame.pack(fill=tk.BOTH, expand=False, pady=2)
+        self.quality_metrics_text = tk.Text(
+            quality_text_frame, height=6, font=self.status_font, wrap="none",
+            relief="solid", bd=1, state="disabled"
+        )
+        self.quality_metrics_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.quality_metrics_scroll = tk.Scrollbar(
+            quality_text_frame, orient="vertical", command=self.quality_metrics_text.yview
+        )
+        self.quality_metrics_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.quality_metrics_text.config(yscrollcommand=self.quality_metrics_scroll.set)

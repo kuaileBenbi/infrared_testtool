@@ -37,7 +37,7 @@ except ImportError:
             pass
 
     GST_AVAILABLE = False
-
+device_map = {"0":22, "11":31}
 
 class CameraFunctions:
     """相机功能类，包含所有相机控制和图像处理功能"""
@@ -189,22 +189,33 @@ class CameraFunctions:
         """发送积分时间设置指令"""
         time.sleep(1) # 等待1秒，让相机初始化
 
-        cmd = f"v4l2-ctl -d /dev/video{self.device_num} --get-ctrl=exposure"
-        result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
-        if result.returncode == 0:
-            exposure_value = result.stdout.strip()  # 获取并清理返回值
-            print(f"积分时间: {exposure_value}")
-            if exposure_value == "3500":
-                time.sleep(0.05)
-                print(f"设置为小积分时间：{1000}")
-                cmd = f"v4l2-ctl -d /dev/video{self.device_num} --set-ctrl=exposure=1000"
-                result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
-                if result.returncode == 0:
-                    print(f"设置积分时间成功: {result.stdout}")
-                else:
-                    print(f"设置积分时间失败: {result.stderr}")
-        else:
-            print(f"获取积分时间失败: {result.stderr}")
+        video_num = device_map[self.device_num]
+        cmd = f"v4l2-ctl -d /dev/video{video_num} --set-ctrl=exposure=1000"
+        try:
+            result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
+        except Exception as e:
+            print(f"发送积分时间设置指令失败: {e}")
+            return
+        
+        if not result.returncode == 0:
+            print(f"积分时间设置失败")
+            return
+        
+        time.sleep(0.05)
+
+        cmd = f"v4l2-ctl -d /dev/video{video_num} --get-ctrl=exposure"
+        try:
+            result = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=2)
+        except Exception as e:
+            print(f"读取积分时间错误")
+            return
+        
+        if not result.returncode == 0:
+            print(f"读取积分时间错误")
+            return
+        
+        exposure_value = result.stdout.strip()  # 获取并清理返回值
+        print(f"积分已设置为: {exposure_value}")
 
     def _start_v4l2_stream(self):
         """启动v4l2流"""

@@ -16,7 +16,7 @@ import numpy as np
 import cv2
 import logging
 from numpy.lib.stride_tricks import sliding_window_view
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import scipy.signal as signal
 
@@ -902,7 +902,7 @@ class ImagePreprocessor:
         np.clip(y, 0.0, 1.0, out=y)
         y = np.power(y, adj_gamma) * max_val
 
-        midtone_boost = 0.08  # 建议 0.05~0.12，小幅提亮
+        midtone_boost = 0.1  # 建议 0.05~0.12，小幅提亮
         y_norm = y / max_val
         y_norm = y_norm + midtone_boost * y_norm * (1.0 - y_norm)  # 只抬中灰
         y = y_norm * max_val
@@ -1367,4 +1367,251 @@ class ImagePreprocessor:
 
         print(f"apply_defog 耗时: {time.time() - start_time:.4f}s | dtype={orig_dtype} | in_scale={in_scale} | ds={fast_ds}")
         return out
+
+    @staticmethod
+    def radial_power_half_freq(img: np.ndarray) -> float:
+        """
+        计算图像的“径向功率谱半功率频率”（-3 dB 点，约等于最大功率的一半），单位：cycles/pixel。
+        用途：作为无参考的频域清晰度代理（频率越高，代表高频细节保留越多）。
+
+        参数
+        ----
+        img : np.ndarray
+            输入灰度图，建议使用线性域（NUC 后、拉伸前）。类型 float/uint16 均可，内部会减均值。
+
+        返回
+        ----
+        float
+            半功率频率（cycles/pixel）。若无法找到半功率点，返回 0.0。
+
+        主要步骤
+        --------
+        1) 使用 Hann 窗抑制边界泄漏；去均值，做 2D FFT 并取功率谱。
+        2) 对功率谱做“径向平均”得到 P(f)，f 表示以像素为单位的空间频率半径。
+        3) 从峰值向外搜索首次降到 0.5*peak 的频率（即 -3 dB 点），线性插值求位置。
+        """
+        # 1) Hann 窗 + 去均值
+        h, w = img.shape
+        wx = np.hanning(w)                           # 水平方向 Hann 窗
+        wy = np.hanning(h)                           # 垂直方向 Hann 窗
+        win = np.outer(wy, wx)                       # 2D 窗
+        I = (img.astype(np.float64) - float(img.mean())) * win
+
+        # 2) 计算 2D FFT 的功率谱（只取 rfft2，节省对称部分开销）
+        F = np.fft.rfft2(I)                          # 频域复数
+        P = (F * np.conj(F)).real                    # 功率谱（非负实数）
+
+        # 3) 生成频率坐标：fy [-0.5,0.5)；fx [0,0.5]（rfft 只到 Nyquist）
+        fy = np.fft.fftfreq(h)[:h]                   # 行方向频率（含负值）
+        fx = np.fft.rfftfreq(w)                      # 列方向非负频率
+        yy, xx = np.meshgrid(fy, fx, indexing='ij')  # 与 P 的形状一致
+        rr = np.sqrt(xx*xx + yy*yy)                  # 每个频点到原点的半径（cycles/pixel）
+
+        # 4) 径向分桶平均（把二维功率按半径分桶求平均，得 P(f)）
+        r = rr.flatten()
+        p = P.flatten()
+        nb = 128                                     # 分桶数：越大越细，但噪声敏感性也增
+        # 理论最大半径约 sqrt(0.5^2 + 0.5^2)（二维 Nyquist 对角）
+        rmax = np.sqrt(0.5**2 + 0.5**2)
+        bins = np.linspace(0, rmax, nb+1)            # 半径边界
+        idx = np.digitize(r, bins) - 1               # 每个点对应的桶索引
+
+        prof = np.zeros(nb, dtype=np.float64)        # 径向平均后的功率
+        count = np.zeros(nb, dtype=np.float64) + 1e-9
+        for i, val in zip(idx, p):
+            if 0 <= i < nb:
+                prof[i] += val
+                count[i] += 1.0
+        prof /= count                                 # 得到径向平均功率曲线
+
+        # 5) 寻找半功率（-3 dB）截止点：首次从峰值下降到 0.5*peak 的位置
+        peak = prof.max()
+        if not np.isfinite(peak) or peak <= 0:
+            return 0.0
+        target = peak * 0.5
+
+        # 用桶中心作为频率坐标，线性插值找到 crossing
+        centers = 0.5 * (bins[:-1] + bins[1:])
+        for i in range(1, nb):
+            if prof[i] <= target:                    # 第一次跌破半功率
+                x0, x1 = centers[i-1], centers[i]
+                y0, y1 = prof[i-1], prof[i]
+                if y1 == y0:
+                    return float(x1)
+                t = (target - y0) / (y1 - y0)        # 线性插值比例
+                return float(x0 + t*(x1 - x0))
+
+        # 若到最高半径仍未跌破（很少见，通常意味着谱很平），返回 0
+        return 0.0
+
+
+    @staticmethod
+    def stripe_index(img: np.ndarray) -> float:
+        """
+        估计行/列“带纹/条纹”强度的无参考指标：低频峰值 / 全频中位数 的最大比值（在行与列两方向取最大）。
+
+        用途
+        ----
+        - 对 MWIR 常见的行/列条纹（FPN/电源纹、读出不均等）敏感。
+        - 值越大，说明低频窄带峰越显著，条纹越明显。
+
+        参数
+        ----
+        img : np.ndarray
+            输入灰度图。
+
+        返回
+        ----
+        float
+            条纹指数（无量纲，>=1 附近通常较轻，显著条纹时会更大）。
+
+        方法
+        ----
+        1) 分别对按“行”和按“列”的 1D 序列做 rFFT。
+        2) 忽略 DC（去均值），在低频窗口（前 5% 频点）找最大峰值。
+        3) 用该方向全频功率谱的中位数作归一，得到峰/中位比；两个方向取最大。
+        """
+        def spectrum_peak_ratio(arr: np.ndarray) -> float:
+            # arr 形状：(N, L)，N 条 1D 曲线，每条长度 L
+            arr = arr.astype(np.float64)
+            arr = arr - arr.mean(axis=1, keepdims=True)   # 去除每条曲线的 DC 分量
+            F = np.fft.rfft(arr, axis=1)                  # 对每条曲线做 rFFT
+            P = (F * np.conj(F)).real                     # 功率谱
+            P = P[:, 1:]                                  # 丢掉 DC（第 0 个频点）
+
+            n = P.shape[1]
+            if n <= 4:
+                return 1.0
+
+            b = max(1, int(0.05 * n))                     # 低频窗口 = 前 5% 频点
+            low = P[:, :b]
+            peak = np.max(low, axis=1)                    # 每条曲线低频段最大峰
+            med = np.median(P, axis=1) + 1e-9             # 每条曲线全频中位数
+            ratio = peak / med
+            return float(np.max(ratio))                   # 返回该方向的最坏条的比值
+
+        # 行方向（逐行做 1D FFT）与列方向（转置后逐行等价于逐列）
+        r = spectrum_peak_ratio(img)                      # 行向条纹
+        c = spectrum_peak_ratio(img.T)                    # 列向条纹
+        return float(max(r, c))
+
+
+    @staticmethod
+    def halo_ratio(img: np.ndarray, r0: int = 2, r1: int = 5, r2: int = 20) -> float:
+        """
+        以最亮点为中心，计算“光晕/鬼影”能量比：外环(r1~r2)能量 / 核心圆(r0)能量。
+        该比值越大，说明亮点周围存在越多的外扩能量，可能来自杂散光、镀膜不良、内反射等。
+
+        参数
+        ----
+        img : np.ndarray
+            输入灰度图。
+        r0 : int
+            核心半径（像素），很小（2~3）以保证取到主峰能量。
+        r1 : int
+            外环内径（像素），避免包含核心主峰的扩展。
+        r2 : int
+            外环外径（像素），设定考察光晕的最大范围。
+
+        返回
+        ----
+        float
+            光晕比（无量纲），越大表明外围能量越突出。
+
+        注意
+        ----
+        - 若图像没有明显亮点，该指标意义变弱；可在实际使用中先限定 ROI 或基于阈值挑选兴趣点。
+        - r0/r1/r2 的选择需考虑分辨率与 PSF 尺度；一般 r2 取 10~30 像素较常见。
+        """
+        H, W = img.shape
+        img = img.astype(np.float64)
+
+        # 找最亮像素作为“点源/尖亮”近似中心
+        cy, cx = np.unravel_index(int(np.argmax(img)), img.shape)
+
+        # 生成以该点为中心的半径图
+        yy, xx = np.indices(img.shape)
+        rr = np.hypot(yy - cy, xx - cx)
+
+        # 计算核心圆能量（避免除零，加了微小正数）
+        E0 = img[rr <= r0].sum() + 1e-12
+
+        # 计算环形区域能量
+        ring_mask = (rr >= r1) & (rr <= r2)
+        Ering = img[ring_mask].sum()
+
+        return float(Ering / E0)
+
+
+    @staticmethod
+    def lowfreq_rms_ratio(img: np.ndarray, sigma: float = 20.0) -> float:
+        """
+        估计“低频背景起伏占比”：强平滑后的背景 RMS / 全图均值。
+        用途：反映大尺度不均匀（可能由杂散光、遮光不足、照明/环境热背景不匀等造成）。
+
+        参数
+        ----
+        img : np.ndarray
+            输入灰度图。
+        sigma : float
+            高斯滤波标准差（像素）。越大代表提取越低频的背景趋势。典型 15~30。
+
+        返回
+        ----
+        float
+            低频起伏比（无量纲）。越大说明背景起伏/坡度越显著。
+
+        方法
+        ----
+        - 使用大核高斯模糊近似“背景场”B；
+        - 计算 B 的标准差（RMS）并除以图像的全局均值，实现无量纲归一。
+        """
+        img = img.astype(np.float64)
+        # 根据 sigma 选择足够大的核尺寸（6*sigma 覆盖 99% 能量），并保证奇数
+        k = int(max(3, sigma * 6))
+        if k % 2 == 0:
+            k += 1
+
+        base = cv2.GaussianBlur(img, (k, k), sigmaX=sigma, sigmaY=sigma,
+                                borderType=cv2.BORDER_REPLICATE)
+        rms = float(base.std())
+        mean = float(img.mean()) + 1e-12
+        return float(rms / mean)
+
+
+    @staticmethod
+    def temporal_noise_and_fpn(stack: np.ndarray) -> Tuple[float, float]:
+        """
+        在短序列（同一场景、同一设置）上分离“时间噪声（Temporal Noise）”与“固定图样噪声（FPN）”。
+
+        参数
+        ----
+        stack : np.ndarray
+            形状 (T, H, W) 的帧序列；T >= 2。建议在 NUC 后、拉伸前、且场景基本静止下采集。
+
+        返回
+        ----
+        (tnoise, fpn) : Tuple[float, float]
+            tnoise：时间噪声（逐像素对时间求 std，再对空间求均值），单位与像素值一致；
+            fpn   ：固定图样噪声（逐像素对时间求均值得到“均值图”，再对空间求 std）。
+
+        说明
+        ----
+        - tnoise 主要反映读出噪声/散粒噪声等“随时间变化”的随机成分；
+        - fpn    反映逐像素偏置/增益残差等“随时间固定”的空间纹理；
+        - 若 stack 过短或场景有运动，估计会偏大（请尽量收集静止短序列 4~16 帧）。
+        """
+        if stack.ndim != 3 or stack.shape[0] < 2:
+            return float('nan'), float('nan')
+
+        stack = stack.astype(np.float64)
+        # 逐像素时间标准差（T 维），再做空间均值 → 时间噪声
+        perpix_std = stack.std(axis=0, ddof=1)        # 形状 (H, W)
+        tnoise = float(perpix_std.mean())
+
+        # 逐像素时间均值，形成“均值图”，再做空间标准差 → FPN
+        perpix_mean = stack.mean(axis=0)              # 形状 (H, W)
+        fpn = float(perpix_mean.std())
+
+        return tnoise, fpn
 
