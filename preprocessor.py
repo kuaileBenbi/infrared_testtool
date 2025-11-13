@@ -1171,6 +1171,194 @@ class ImagePreprocessor:
 
         print(f"apply_sharping 处理耗时: {time.time() - start_time:.4f} 秒")
         return result
+    
+    
+    def apply_defog(
+        self,
+        image: np.ndarray,
+        max_val: int | None = None,     # 输入量程（如 4095/16383），不指定自动推断
+        win: int = 15,                  # 暗通道窗口
+        w: float = 0.75,                # 去雾强度
+        radius: int = 20,               # 引导滤波半径（原始分辨率的半径）
+        eps: float = 1e-3,              # 引导滤波正则
+        t0: float = 0.65,               # 透射率下限
+        percent: float = 0.001,         # A 候选比例（Top 百分比）
+        fast_ds: int = 2,               # 估计 t 的降采样倍数
+        gf_ds: int | None = None,       # 引导滤波的降采样倍数（缺省同 fast_ds）
+        use_ximgproc: bool = True,      # 如果装了 ximgproc.guidedFilter，就用它
+        num_threads: int | None = None  # OpenCV 线程数（None=保持默认）
+    ) -> np.ndarray:
+        import time, cv2, numpy as np
+        t_start = time.time()
+        if num_threads is not None:
+            cv2.setNumThreads(int(num_threads))
+        cv2.setUseOptimized(True)
+
+        # ---- 灰度化 + 归一化到 [0,1]（float32，带来 ~2x 带宽收益）----
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        H, W = image.shape
+        scale_max = self._infer_scale_max(image, max_val)
+        inv_scale = 1.0 / max(scale_max, 1e-6)
+        I01 = image.astype(np.float32) * inv_scale  # float32
+
+        # ---- 估计 A（在低分辨率上做 + Top-k 选取，避免全排序）----
+        if fast_ds > 1:
+            newW, newH = max(1, W // fast_ds), max(1, H // fast_ds)
+            I_small = cv2.resize(I01, (newW, newH), interpolation=cv2.INTER_AREA)
+            A = self._estimate_A_gray_fast(I_small, percent=percent)
+        else:
+            A = self._estimate_A_gray_fast(I01, percent=percent)
+
+        # ---- 估计 t：t = 1 - w * min_{Ω} (I / A)（在低分辨率上做）----
+        if fast_ds > 1:
+            # I/A 后再取局部最小（腐蚀）
+            IA_small = (I_small * (1.0 / max(A, 1e-6))).astype(np.float32)
+            t_small = self._estimate_t_gray_fast(IA_small, w=w, win=win)
+            t_up = cv2.resize(t_small, (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            IA = (I01 * (1.0 / max(A, 1e-6))).astype(np.float32)
+            t_up = self._estimate_t_gray_fast(IA, w=w, win=win)
+
+        # ---- 引导滤波（Fast Guided Filter：在低分辨率上求 a,b，再上采样）----
+        if gf_ds is None:
+            gf_ds = fast_ds
+        if gf_ds > 1:
+            t_ref = self._fast_guided_filter(I01, t_up, radius=radius, eps=eps, subsample=gf_ds, use_ximgproc=use_ximgproc)
+        else:
+            t_ref = self._guided_filter_fast(I01, t_up, radius=radius, eps=eps, use_ximgproc=use_ximgproc)
+
+        # ---- 下限 & 恢复 J = (I - A) / max(t, t0) + A ----
+        # 用就地操作，减少分配
+        np.maximum(t_ref, t0, out=t_ref)
+        J01 = I01.copy()
+        J01 -= A
+        J01 /= t_ref
+        J01 += A
+        np.clip(J01, 0.0, 1.0, out=J01)
+
+        # ---- 映射回原量程 + dtype（保持 uint16 输出）----
+        out = np.rint(J01 * scale_max).astype(np.uint16)
+
+        print(f"apply_defog 处理耗时: {time.time() - t_start:.4f} 秒")
+        return out
+
+
+    # -------- 辅助：A 的快速估计（Top-k，避免全排序；灰度版）--------
+    def _estimate_A_gray_fast(self, I01: np.ndarray, percent: float = 0.001) -> float:
+        # I01: [0,1] float32
+        h, w = I01.shape
+        n = h * w
+        k = max(1, int(n * percent))
+        flat = I01.reshape(-1)
+        # 找到 top-k 的阈值，再取这些里均值或中位数作为 A，更稳
+        # np.partition 复杂度 O(n)
+        idx = n - k
+        kth = np.partition(flat, idx)[idx]
+        mask = flat >= kth
+        top_vals = flat[mask]
+        # 取中位或均值都可；中位更抗 outlier，这里选中位
+        A = float(np.median(top_vals))
+        return A
+
+    def _infer_scale_max(self, img: np.ndarray, in_max: int | None) -> float:
+        if in_max is not None:
+            return float(in_max)
+        if np.issubdtype(img.dtype, np.integer):
+            if img.dtype == np.uint8:
+                return 255.0
+            maxv = int(img.max())
+            if maxv <= 1023:   return 1023.0
+            if maxv <= 4095:   return 4095.0
+            if maxv <= 16383:  return 16383.0
+            return float(np.iinfo(img.dtype).max)  # 65535
+        return 1.0  # float类型默认视为[0,1]
+
+    # -------- 辅助：t 的快速估计（局部最小用腐蚀；灰度版）--------
+    def _estimate_t_gray_fast(self, IA01: np.ndarray, w: float = 0.75, win: int = 15) -> np.ndarray:
+        # IA01: 已经是 I/A 的 [0,1]，float32
+        kernel = self._get_rect_kernel(win)
+        # 局部最小
+        min_local = cv2.erode(IA01, kernel, iterations=1)
+        # t = 1 - w * min
+        t = 1.0 - (w * min_local)
+        return t
+
+
+    # -------- 辅助：获取 & 复用矩形核（减少每帧创建开销）--------
+    def _get_rect_kernel(self, win: int):
+        k = getattr(self, "_ker_cache", None)
+        if k is None:
+            self._ker_cache = {}
+        if win not in self._ker_cache:
+            self._ker_cache[win] = cv2.getStructuringElement(cv2.MORPH_RECT, (win, win))
+        return self._ker_cache[win]
+
+
+    # -------- 标准 Guided Filter（灰度版，O(1) 算子 + boxFilter）--------
+    def _guided_filter_fast(self, I: np.ndarray, p: np.ndarray, radius: int, eps: float, use_ximgproc: bool = True) -> np.ndarray:
+        # I, p: [0,1] float32, 单通道
+        try:
+            if use_ximgproc and hasattr(cv2, "ximgproc"):
+                return cv2.ximgproc.guidedFilter(guide=I, src=p, radius=radius, eps=float(eps), dDepth=-1)
+        except Exception:
+            pass
+        r = int(radius)
+        box = lambda x: cv2.boxFilter(x, ddepth=-1, ksize=(2*r+1, 2*r+1), borderType=cv2.BORDER_REFLECT)
+
+        mean_I  = box(I)
+        mean_p  = box(p)
+        mean_Ip = box(I * p)
+        cov_Ip  = mean_Ip - mean_I * mean_p
+
+        mean_II = box(I * I)
+        var_I   = mean_II - mean_I * mean_I
+
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+
+        mean_a = box(a)
+        mean_b = box(b)
+        q = mean_a * I + mean_b
+        return q
+
+
+    # -------- Fast Guided Filter（低分辨率上求 a,b，再上采样）--------
+    def _fast_guided_filter(self, I: np.ndarray, p: np.ndarray, radius: int, eps: float, subsample: int = 2, use_ximgproc: bool = True) -> np.ndarray:
+        if subsample <= 1:
+            return self._guided_filter_fast(I, p, radius, eps, use_ximgproc=use_ximgproc)
+
+        H, W = I.shape
+        h, w = max(1, H // subsample), max(1, W // subsample)
+
+        I_s = cv2.resize(I, (w, h), interpolation=cv2.INTER_AREA)
+        p_s = cv2.resize(p, (w, h), interpolation=cv2.INTER_LINEAR)
+        r_s = max(1, int(round(radius / subsample)))
+
+        # 先在低分辨率上跑一次 guided，拿到 a,b 的均值近似
+        r = int(r_s)
+        box = lambda x: cv2.boxFilter(x, ddepth=-1, ksize=(2*r+1, 2*r+1), borderType=cv2.BORDER_REFLECT)
+
+        mean_I  = box(I_s)
+        mean_p  = box(p_s)
+        mean_Ip = box(I_s * p_s)
+        cov_Ip  = mean_Ip - mean_I * mean_p
+
+        mean_II = box(I_s * I_s)
+        var_I   = mean_II - mean_I * mean_I
+
+        a_s = cov_Ip / (var_I + eps)
+        b_s = mean_p - a_s * mean_I
+
+        mean_a_s = box(a_s)
+        mean_b_s = box(b_s)
+
+        # 上采样到原分辨率，再计算 q = mean_a*I + mean_b
+        mean_a = cv2.resize(mean_a_s, (W, H), interpolation=cv2.INTER_LINEAR)
+        mean_b = cv2.resize(mean_b_s, (W, H), interpolation=cv2.INTER_LINEAR)
+        q = mean_a * I + mean_b
+        return q
+
 
 
     def draw_center_cross_polylines(self, image, color=(255, 255, 255), thickness=5):
@@ -1215,158 +1403,6 @@ class ImagePreprocessor:
         print(f"draw_center_cross_polylines 处理耗时: {elapsed_time:.4f} 秒")
         return image
 
-    def apply_defog(
-        self,
-        image,
-        t_min=0.12,                  # 略提高下限，减少过度去雾导致变暗
-        omega=0.90,                  # 略降低去雾强度
-        guided_filter_radius=20,     # 半径调小，+ 透射率降采样，整体更快
-        guided_filter_eps=1e-3,
-        in_max=None,
-        # ---- 新增：加速与稳态选项 ----
-        fast_ds=2,                   # 透射率在 1/fast_ds 分辨率估计
-        blend_power=0.5,             # 混合权重指数，越小越“温和”
-        blend_min=0.15,              # 最小混合权重
-        blend_max=0.85,              # 最大混合权重
-        do_exposure_comp=True,       # 去雾后做一次全局曝光匹配
-        comp_p=0.75,                 # 用第 p 分位数做匹配，0.6~0.85 均可
-        comp_clip=(0.8, 1.25)        # 增益裁剪范围，避免过度提亮/压暗
-    ):
-        """
-        暗通道去雾（IR灰度/三通道；保持原始dtype与量程；快速&不易变黑）
-        """
-        import time, cv2, numpy as np
-        start_time = time.time()
-
-        orig_dtype = image.dtype
-        is_gray = (image.ndim == 2)
-
-        # ---- 构造 3 通道参与计算（灰度不做颜色增强，只是走流程）----
-        if is_gray:
-            img3 = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        else:
-            img3 = image
-        img3 = img3.astype(np.float32)
-
-        # ---- 识别/设定输入满量程 ----
-        def _auto_in_max(arr_u16):
-            vmax = int(arr_u16.max()) if arr_u16.size else 0
-            if vmax <= 4095:  return 4095.0   # 12-bit
-            if vmax <= 16383: return 16383.0  # 14-bit
-            return 65535.0                    # 16-bit 默认
-        if in_max is None:
-            if orig_dtype == np.uint16:
-                in_scale = _auto_in_max(image)
-            elif orig_dtype == np.uint8:
-                in_scale = 255.0
-            else:
-                cur_max = float(img3.max()) if img3.size else 1.0
-                in_scale = max(cur_max, 1.0)
-        else:
-            in_scale = float(in_max)
-
-        # ---- 归一化到[0,1] ----
-        img = np.clip(img3 / max(in_scale, 1.0), 0.0, 1.0)
-
-        # ---- 内部函数 ----
-        def get_dark_channel(im, patch=15):
-            k = max(3, int(patch) | 1)
-            min_c = np.min(im, axis=2)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
-            return cv2.erode(min_c, kernel)
-
-        def estimate_atmospheric_light(im, dark, top_percent=0.001):
-            h, w = im.shape[:2]
-            n = max(1, int(h * w * top_percent))
-            flat_dark = dark.reshape(-1)
-            idx = np.argpartition(flat_dark, -n)[-n:]
-            cand = im.reshape(-1, 3)[idx]
-            A = cand[np.argmax(np.linalg.norm(cand, axis=1))]
-            return np.maximum(A, 1e-3)
-
-        def estimate_transmission(im, A, omega_=0.95, patch=15):
-            normalized = im / (A[None, None, :] + 1e-6)
-            dark_norm = get_dark_channel(normalized, patch)
-            return 1.0 - omega_ * dark_norm
-
-        def guided_filter(guide_rgb, src, radius, eps):
-            guide = guide_rgb
-            if guide.ndim == 3:
-                guide = cv2.cvtColor(guide, cv2.COLOR_BGR2GRAY)
-            guide = guide.astype(np.float32)  # 已在[0,1]
-            src = src.astype(np.float32)
-
-            k = int(radius)
-            k = (2*k + 1, 2*k + 1)  # 半径->窗口
-            mean_g  = cv2.boxFilter(guide, -1, k, normalize=True)
-            mean_s  = cv2.boxFilter(src,   -1, k, normalize=True)
-            mean_gs = cv2.boxFilter(guide * src, -1, k, normalize=True)
-
-            cov_gs = mean_gs - mean_g * mean_s
-            var_g  = cv2.boxFilter(guide * guide, -1, k, normalize=True) - mean_g * mean_g
-
-            a = cov_gs / (var_g + eps)
-            b = mean_s - a * mean_g
-
-            mean_a = cv2.boxFilter(a, -1, k, normalize=True)
-            mean_b = cv2.boxFilter(b, -1, k, normalize=True)
-            return mean_a * guide + mean_b
-
-        # ---- 1) 暗通道（全分辨率）----
-        dark_full = get_dark_channel(img, patch=15)
-
-        # ---- 2) 大气光（全分辨率top0.1%）----
-        A = estimate_atmospheric_light(img, dark_full, top_percent=0.001)
-
-        # ---- 3) 透射率：低分辨率估计 -> 上采样 -> 引导滤波细化（更快）----
-        if fast_ds and fast_ds > 1:
-            H, W = img.shape[:2]
-            h, w = (H + fast_ds - 1) // fast_ds, (W + fast_ds - 1) // fast_ds
-            img_lr = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
-            # patch 与半径随分辨率缩放
-            patch_lr = max(3, (15 // fast_ds) | 1)
-            t_lr = estimate_transmission(img_lr, A, omega_=omega, patch=patch_lr)
-            t0 = cv2.resize(t_lr, (W, H), interpolation=cv2.INTER_LINEAR)
-        else:
-            t0 = estimate_transmission(img, A, omega_=omega, patch=15)
-
-        t0 = np.clip(t0, 0.0, 1.0)
-        t = guided_filter(img, t0, guided_filter_radius, guided_filter_eps)
-        t = np.nan_to_num(t, nan=1.0, posinf=1.0, neginf=1.0)
-
-        # ---- 4) 恢复图像（广播，无循环）----
-        t_clip = np.clip(t, t_min, 0.999)
-        J = (img - A[None, None, :]) / t_clip[..., None] + A[None, None, :]
-
-        # ---- 5) 自适应“柔性去雾”：按 t 做混合，避免晴朗区域被过度处理 ----
-        # w = clamp( (1 - t)^blend_power , blend_min, blend_max )
-        w = np.clip((1.0 - t) ** float(blend_power), float(blend_min), float(blend_max))
-        # 对灰度而言三通道等同；对可见光也能生效
-        J_soft = w[..., None] * J + (1.0 - w)[..., None] * img
-
-        # ---- 6) 曝光匹配（分位数）以避免整体偏暗 ----
-        Jx = J_soft
-        if do_exposure_comp:
-            # 用分位数（默认 75%）在[0,1]域做一次全局增益
-            q_src = np.quantile(img,  comp_p)
-            q_dst = np.quantile(Jx,   comp_p)
-            gain = q_src / max(q_dst, 1e-6)
-            gmin, gmax = comp_clip
-            gain = float(np.clip(gain, gmin, gmax))
-            Jx = np.clip(Jx * gain, 0.0, 1.0)
-
-        # ---- 7) 回写原量程 & dtype ----
-        if orig_dtype == np.uint16:
-            out3 = (Jx * in_scale + 0.5).astype(np.uint16)
-        elif orig_dtype == np.uint8:
-            out3 = (Jx * 255.0 + 0.5).astype(np.uint8)
-        else:
-            out3 = (Jx * in_scale).astype(np.float32)
-
-        out = cv2.cvtColor(out3, cv2.COLOR_BGR2GRAY) if is_gray else out3
-
-        print(f"apply_defog 耗时: {time.time() - start_time:.4f}s | dtype={orig_dtype} | in_scale={in_scale} | ds={fast_ds}")
-        return out
 
     @staticmethod
     def radial_power_half_freq(img: np.ndarray) -> float:
