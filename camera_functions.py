@@ -988,6 +988,7 @@ class CameraFunctions:
 
     def linear_multi_point_correction(self):
         """线性校正"""
+        print(f"线性校正文件路径: {self.whonpz}")
         if not self.linear_nuc_enabled:
             try:
                 if not os.path.exists(self.whonpz):
@@ -1017,6 +1018,7 @@ class CameraFunctions:
 
     def quadrast_multi_point_correction(self):
         """非线性校正"""
+        print(f"非线性校正文件路径: {self.whonpz}")
         if not self.quadrast_nuc_enabled:
             try:
                 if not os.path.exists(self.whonpz):
