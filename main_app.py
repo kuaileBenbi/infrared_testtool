@@ -14,6 +14,12 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.font_manager as fm
 
+
+def cv_imread(filepath, flags=-1):
+    """支持中文路径的 imread"""
+    return cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), flags)
+
+
 # 配置matplotlib中文字体
 def setup_matplotlib_chinese_font():
     """设置matplotlib中文字体"""
@@ -277,9 +283,12 @@ class CameraApp:
 
         try:
             # 使用OpenCV加载图像
-            image = cv2.imread(filepath, -1)
-            # print(image.mean())
-            
+            image = cv_imread(filepath, -1)
+
+            if image is None:
+                print(f"无法加载图像: {filepath}")
+                return
+
             # 更新图像统计信息到status_frame
             if hasattr(self.ui, 'image_stats_text'):
                 stats_text = f"图像统计:\nmean={image.mean():.1f}\nmin={image.min()}\nmax={image.max()}"
@@ -287,9 +296,6 @@ class CameraApp:
                 self.ui.image_stats_text.delete(1.0, tk.END)
                 self.ui.image_stats_text.insert(1.0, stats_text)
                 self.ui.image_stats_text.config(state="disabled")
-            if image is None:
-                print(f"无法加载图像: {filepath}")
-                return
 
             # 如果是彩色图像，转换为灰度
             if len(image.shape) == 3:
@@ -1153,7 +1159,7 @@ class CameraApp:
 
     def calculate_image_quality_metrics(self):
         """计算并显示五个图像质量指标"""
-        from preprocessor import ImagePreprocessor as IP
+        from preprocessor import ImagePreprocessor
         gray = self._get_gray_current()
         if gray is None:
             print("没有可用的图像数据")

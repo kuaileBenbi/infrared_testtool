@@ -4,6 +4,11 @@ import numpy as np
 import time
 
 
+def cv_imread(filepath, flags=-1):
+    """支持中文路径的 imread"""
+    return cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), flags)
+
+
 def default_process(img, identity):
     """
     默认处理流程：非均匀校正 -> 盲元检测与补偿 -> 拉伸 -> 16位数据
@@ -21,7 +26,7 @@ def default_process(img, identity):
     a_map, b_map, global_a, global_b = nuc_para["a_map"], nuc_para["b_map"], nuc_para["ga"], nuc_para["gb"]
     bp_para = np.load(bp_path)["blind"].astype(bool)
 
-    frame = cv2.imread(img_path, -1)
+    frame = cv_imread(img_path, -1)
 
     max_val = 4095 if identity == "mwir_fix" else 16383
 

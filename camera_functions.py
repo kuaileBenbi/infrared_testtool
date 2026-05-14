@@ -13,6 +13,11 @@ from PIL import Image, ImageTk
 from collections import deque
 from preprocessor import ImagePreprocessor
 
+
+def cv_imread(filepath, flags=-1):
+    """支持中文路径的 imread"""
+    return cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), flags)
+
 try:
     import gi
 
@@ -135,7 +140,7 @@ class CameraFunctions:
         """初始化背景帧"""
         try:
             if os.path.exists("background_frame.png"):
-                self.background_frame = cv2.imread("background_frame.png", -1)
+                self.background_frame = cv_imread("background_frame.png", -1)
                 print(f"背景帧已加载: {self.background_frame.mean()}")
         except Exception:
             pass
@@ -485,7 +490,7 @@ class CameraFunctions:
         interval = 1.0 / self.fps
         try:
             if os.path.exists("display_20250517_085815_929.png"):
-                frame_cached = cv2.imread("display_20250517_085815_929.png", -1)
+                frame_cached = cv_imread("display_20250517_085815_929.png", -1)
             else:
                 frame_cached = np.random.randint(0, 65536, (512, 640), dtype=np.uint16)
         except Exception:
